@@ -6,10 +6,12 @@ from nonebot.plugin import PluginMetadata
 from nonebot.matcher import Matcher
 from datetime import datetime
 from pydantic import BaseModel
+from typing import cast
 from nonebot import require
 import json
 import httpx
 import asyncio
+import base64
 from openai import AsyncOpenAI
 
 from pathlib import Path
@@ -27,7 +29,7 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
 )
 
-config: Config = get_plugin_config(Config)
+config: Config = cast(Config, get_plugin_config(Config))
 
 llm_client = AsyncOpenAI(base_url=config.meme_llm_base_url, api_key=config.meme_llm_api_key)
 
@@ -37,6 +39,10 @@ meme_manager_lock = asyncio.Lock()
 
 with open(__file__, "r", encoding="utf-8") as f:
     __plugin_meta__.extra["source_code"] = f.read()
+
+def b2s64(image_bytes: bytes, ext: str) -> str:
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:image/{ext};base64,{encoded}"
 
 class Meme(BaseModel):
     hash: str # 这里用md5哈希作为唯一标识
@@ -218,9 +224,12 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
 
         if image_enable:
             assert meme_reciev is not None
-            prompts[0]['content'].append({"type": "input_image", "image_url": b2s64(meme_reciev[1])})
+            image_bytes = meme_reciev[1]
+            ext = meme_reciev[3]
+            prompts[0]['content'].append({"type": "input_image", "image_url": b2s64(image_bytes, ext)})
 
         resp = await llm_client.responses.create(
             model=config.meme_llm_model,
-            input=prompts
+            input=prompts,  # type: ignore
         )
+        
