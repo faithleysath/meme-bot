@@ -207,3 +207,20 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
         prompt = f"你是一个qq机器人插件的运行组成部分，下面是该插件的源代码。你目前被rfegtds处的代码调用了，请你理解插件的运行原理，返回符合要求的json字符串，使得插件能正确运行。\n\n Source Code:\n\n{__plugin_meta__.extra['source_code']}\n\n一些运行时变量：\n\n"
 
         # 提示词的一部分：调用代码地址rfegtds
+        prompts = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                ]
+            }
+        ]
+
+        if image_enable:
+            assert meme_reciev is not None
+            prompts[0]['content'].append({"type": "input_image", "image_url": b2s64(meme_reciev[1])})
+
+        resp = await llm_client.responses.create(
+            model=config.meme_llm_model,
+            input=prompts
+        )
