@@ -10,6 +10,7 @@ from nonebot import require
 import json
 import httpx
 import asyncio
+from openai import AsyncOpenAI
 
 from pathlib import Path
 
@@ -27,6 +28,8 @@ __plugin_meta__ = PluginMetadata(
 )
 
 config: Config = get_plugin_config(Config)
+
+llm_client = AsyncOpenAI(base_url=config.meme_llm_base_url, api_key=config.meme_llm_api_key)
 
 self_sent_time: float = 0
 meme_reciev: tuple[int, bytes, str, str, float] | None = None # (message_id, image_bytes, image_hash, ext, timestamp)
@@ -126,7 +129,7 @@ async def is_target_user(event: MessageEvent) -> bool:
             return False
         bot_id = int(list(bots.keys())[0])
         config.meme_listen_user_id = bot_id
-    return (event.user_id == config.meme_listen_user_id) and (datetime.now().timestamp() - self_sent_time > config.meme_self_sent_timeout)
+    return (event.user_id == config.meme_listen_user_id) and (datetime.now().timestamp() - self_sent_time > config.meme_self_sent_timeout) # 防止bot响应的消息被当成请求，默认为2秒
 
 @rule_wrapper
 async def is_reply_message(event: MessageEvent) -> bool:
@@ -164,50 +167,43 @@ async def finish_and_throttle(matcher: Matcher, message: str):
 # 管理表情包
 @target_private_matcher.handle()
 async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
-    global self_sent_time, meme_reciev
+    global meme_reciev
+    MERGE_TIME_WINDOW = 10 # 合并时间窗口，单位为秒
     async with meme_manager_lock:
+        image_segment: MessageSegment | None = None
         # 检查图片数量
         image_num = len(event.message['image'])
         if image_num > 1:
             await finish_and_throttle(matcher, "一次只能发送一张图片哦~")
             return
-        # 分为无图片和有图片两种情况
+        
+        # 缓存图片
         if image_num == 1:
-            # 处理仅包含图片的消息
-            if event.message.only("image"):
-                segment: MessageSegment = event.message[0]
-                hash, ext = segment.data.get("file", "").split(".")
-                # 下载图片
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(segment.data.get("url", ""))
-                    if resp.status_code != 200:
-                        await finish_and_throttle(matcher, "图片下载失败，请稍后再试~")
-                        return
-                    image_bytes = resp.content
-                meme_reciev = (event.message_id, image_bytes, hash, ext, datetime.now().timestamp())
-                await finish_and_throttle(matcher, "图片已接收，请发送描述或标签~")
-                return
-            else:
-                await finish_and_throttle(matcher, "请只发送一张图片哦~")
-                return
-        else:
-            # 处理无图片的消息
-            if meme_reciev is None:
-                await finish_and_throttle(matcher, "请先发送一张图片哦~")
-                return
+            image_segment = event.message["image", 0]
+        elif event.reply is not None and len(event.reply.message['image']) == 1:
+            image_segment = event.reply.message["image", 0]
 
-            description = event.message.extract_plain_text().strip()
-            if not description:
-                await finish_and_throttle(matcher, "描述不能为空，请重新发送~")
-                return
+        if image_segment:
+            hash, ext = image_segment.data.get("file", "").split(".")
+            # 下载图片
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(image_segment.data.get("url", ""))
+                if resp.status_code != 200:
+                    await finish_and_throttle(matcher, "图片下载失败，请稍后再试~")
+                    return
+                image_bytes = resp.content
+            meme_reciev = (event.message_id, image_bytes, hash, ext, datetime.now().timestamp())
 
-            message_id, image_bytes, image_hash, ext, timestamp = meme_reciev
-            meme = Meme(hash=image_hash, ext=ext, description=description)
-            if meme_store.get_meme(image_hash):
-                await finish_and_throttle(matcher, "这张图片已经存在于数据库中啦~")
-                return
-            
-            meme_store.add_meme(meme)
-            meme_reciev = None
-            await finish_and_throttle(matcher, f"图片已保存，hash: {image_hash}，描述: {description}")
-            return
+        # 获取并合并可能存在的引用消息的纯文本内容
+        current_msg_text = event.message.extract_plain_text().strip()
+        reply_msg_text = ""
+        if event.reply is not None:
+            reply_msg_text = event.reply.message.extract_plain_text().strip()
+        
+        # 检查缓存图片是否过期
+        image_enable = meme_reciev is not None and (datetime.now().timestamp() - meme_reciev[4] <= MERGE_TIME_WINDOW)
+
+        # 构建提示词
+        prompt = f"你是一个qq机器人插件的运行组成部分，下面是该插件的源代码。你目前被rfegtds处的代码调用了，请你理解插件的运行原理，返回符合要求的json字符串，使得插件能正确运行。\n\n Source Code:\n\n{__plugin_meta__.extra['source_code']}\n\n一些运行时变量：\n\n"
+
+        # 提示词的一部分：调用代码地址rfegtds
