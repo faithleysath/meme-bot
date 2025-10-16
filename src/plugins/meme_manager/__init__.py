@@ -3,11 +3,13 @@ from nonebot.rule import Rule
 from nonebot.permission import Permission
 from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, MessageSegment
 from nonebot.plugin import PluginMetadata
+from nonebot.matcher import Matcher
 from datetime import datetime
 from pydantic import BaseModel
 from nonebot import require
 import json
 import httpx
+import asyncio
 
 from pathlib import Path
 
@@ -28,6 +30,7 @@ config: Config = get_plugin_config(Config)
 
 self_sent_time: float = 0
 meme_reciev: tuple[int, bytes, str, str, float] | None = None # (message_id, image_bytes, image_hash, ext, timestamp)
+meme_manager_lock = asyncio.Lock()
 
 with open(__file__, "r", encoding="utf-8") as f:
     __plugin_meta__.extra["source_code"] = f.read()
@@ -47,6 +50,7 @@ class Meme(BaseModel):
 class MemeManagerStore():
     def __init__(self):
         self.db_file: Path = store.get_plugin_data_file("memes.json")
+        print(self.db_file)
         # try to create the file if not exists
         if not self.db_file.exists():
             self.db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +107,8 @@ class MemeManagerStore():
                 return meme
         logger.warning(f"Meme with short_term {short_term} not found.")
         return None
+
+meme_store = MemeManagerStore()
             
 def rule_wrapper(func):
     return Rule(func)
@@ -150,43 +156,58 @@ async def not_to_me(event: MessageEvent) -> bool:
 # 监听来自目标用户的私聊消息
 target_private_matcher = on_message(permission=is_target_user, rule=to_me, priority=5)
 
-@target_private_matcher.handle()
-async def handle_target_private(event: PrivateMessageEvent):
-    global self_sent_time, meme_reciev
-    # 检查图片数量
-    image_num = len(event.message['image'])
-    if image_num > 1:
-        await target_private_matcher.finish("一次只能发送一张图片哦~")
-    # 分为无图片和有图片两种情况
-    if image_num == 1:
-        # 处理仅包含图片的消息
-        if event.message.only("image"):
-            segment: MessageSegment = event.message[0]
-            hash, ext = segment.data.get("file", "").split(".")
-            # 下载图片
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(segment.data.get("url", ""))
-                if resp.status_code != 200:
-                    await target_private_matcher.finish("图片下载失败，请稍后再试~")
-                image_bytes = resp.content
-            meme_reciev = (event.message_id, image_bytes, hash, ext, datetime.now().timestamp())
-            await target_private_matcher.finish("图片已接收，请发送描述或标签~")
-        else:
-            await target_private_matcher.finish("请只发送一张图片哦~")
-    else:
-        # 处理无图片的消息
-        if meme_reciev is None:
-            await target_private_matcher.finish("请先发送一张图片哦~")
-        description = event.message.extract_plain_text().strip()
-        if not description:
-            await target_private_matcher.finish("描述不能为空，请重新发送~")
-        message_id, image_bytes, image_hash, ext, timestamp = meme_reciev
-        meme = Meme(hash=image_hash, ext=ext, description=description)
-        store = MemeManagerStore()
-        if store.get_meme(image_hash):
-            await target_private_matcher.finish("这张图片已经存在于数据库中啦~")
-        store.add_meme(meme)
-        meme_reciev = None
-        self_sent_time = datetime.now().timestamp()
-        await target_private_matcher.finish(f"图片已保存，hash: {image_hash}，描述: {description}")
+async def finish_and_throttle(matcher: Matcher, message: str):
+    global self_sent_time
     self_sent_time = datetime.now().timestamp()
+    await matcher.finish(message)
+
+# 管理表情包
+@target_private_matcher.handle()
+async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
+    global self_sent_time, meme_reciev
+    async with meme_manager_lock:
+        # 检查图片数量
+        image_num = len(event.message['image'])
+        if image_num > 1:
+            await finish_and_throttle(matcher, "一次只能发送一张图片哦~")
+            return
+        # 分为无图片和有图片两种情况
+        if image_num == 1:
+            # 处理仅包含图片的消息
+            if event.message.only("image"):
+                segment: MessageSegment = event.message[0]
+                hash, ext = segment.data.get("file", "").split(".")
+                # 下载图片
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(segment.data.get("url", ""))
+                    if resp.status_code != 200:
+                        await finish_and_throttle(matcher, "图片下载失败，请稍后再试~")
+                        return
+                    image_bytes = resp.content
+                meme_reciev = (event.message_id, image_bytes, hash, ext, datetime.now().timestamp())
+                await finish_and_throttle(matcher, "图片已接收，请发送描述或标签~")
+                return
+            else:
+                await finish_and_throttle(matcher, "请只发送一张图片哦~")
+                return
+        else:
+            # 处理无图片的消息
+            if meme_reciev is None:
+                await finish_and_throttle(matcher, "请先发送一张图片哦~")
+                return
+
+            description = event.message.extract_plain_text().strip()
+            if not description:
+                await finish_and_throttle(matcher, "描述不能为空，请重新发送~")
+                return
+
+            message_id, image_bytes, image_hash, ext, timestamp = meme_reciev
+            meme = Meme(hash=image_hash, ext=ext, description=description)
+            if meme_store.get_meme(image_hash):
+                await finish_and_throttle(matcher, "这张图片已经存在于数据库中啦~")
+                return
+            
+            meme_store.add_meme(meme)
+            meme_reciev = None
+            await finish_and_throttle(matcher, f"图片已保存，hash: {image_hash}，描述: {description}")
+            return
