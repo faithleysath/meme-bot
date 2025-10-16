@@ -5,7 +5,7 @@ from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, Messa
 from nonebot.plugin import PluginMetadata
 from nonebot.matcher import Matcher
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import cast
 from nonebot import require
 import json
@@ -13,6 +13,9 @@ import httpx
 import asyncio
 import base64
 from openai import AsyncOpenAI
+from enum import Enum
+from time import time
+import re
 
 from pathlib import Path
 
@@ -44,18 +47,54 @@ def b2s64(image_bytes: bytes, ext: str) -> str:
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/{ext};base64,{encoded}"
 
+def extract_json(text: str) -> dict:
+    """从可能被三引号等包裹的文本中提取出JSON对象"""
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        raise ValueError("在文本中未找到JSON对象")
+    return json.loads(match.group(0))
+
 class Meme(BaseModel):
     hash: str # 这里用md5哈希作为唯一标识
     pHash: str | None = None # 感知哈希，用于相似图片搜索
     ext: str # 文件扩展名，如 jpg, png, gif
     description: str | None = None # 由VLM自动生成的描述
     short_term: str | None = None # 用户添加的简称，全局唯一
-    tags: list[str] = [] # 用户添加的标签，用于辅助搜索
+    tags: list[str] = Field(default_factory=list) # 用户添加的标签，用于辅助搜索
     prompt: str | None = None # 告诉llm何时、如何使用该表情包
     usage_count: int = 0 # 使用次数
     last_used: float | None = None # 上次使用时间戳
-    created_at: float = datetime.now().timestamp() # 创建时间戳
-    updated_at: float = datetime.now().timestamp() # 更新时间戳
+    created_at: float = Field(default_factory=time) # 创建时间戳
+    updated_at: float = Field(default_factory=time) # 更新时间戳
+
+# --- LLM交互协议模型 ---
+
+class Action(str, Enum):
+    ADD_MEME = "ADD_MEME"
+    SEARCH_MEME = "SEARCH_MEME"
+    UPDATE_MEME = "UPDATE_MEME"
+    DELETE_MEME = "DELETE_MEME"
+    NO_ACTION = "NO_ACTION"
+
+class AddPayload(BaseModel):
+    short_term: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    prompt: str | None = None
+
+class SearchPayload(BaseModel):
+    hash: str
+
+class UpdatePayload(BaseModel):
+    hash: str
+    update_data: dict
+
+class DeletePayload(BaseModel):
+    hash: str
+
+class LLMResult(BaseModel):
+    action: Action
+    payload: dict = Field(default_factory=dict)
+    response: str | None = None
 
 class MemeManagerStore():
     def __init__(self):
@@ -212,51 +251,51 @@ async def call_llm(prompts: list) -> str:
             model=config.meme_llm_model,
             input=prompts,  # type: ignore
         )
-        return str(resp)
+        # 假设响应对象有 output_text 属性，根据用户反馈进行调整
+        if hasattr(resp, "output_text"):
+            return resp.output_text
+        raise ValueError("无法从LLM响应中提取文本内容，响应对象缺少'output_text'属性")
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
-        raise  # 重新抛出异常，由上层处理
+        raise
 
 async def process_llm_response(matcher: Matcher, llm_output: str):
     """解析LLM的响应并执行相应的操作"""
     global meme_reciev
     try:
-        result = json.loads(llm_output)
-        action = result.get("action")
-        payload = result.get("payload", {})
-        response_msg = result.get("response") # 移除默认值
+        json_data = extract_json(llm_output)
+        llm_result = LLMResult.model_validate(json_data)
+        action = llm_result.action
+        response_msg = llm_result.response
 
-        if action == "ADD_MEME":
+        if action == Action.ADD_MEME:
             if meme_reciev is None:
                 await finish_and_throttle(matcher, "请先发送一张图片才能添加哦~")
                 return
             
+            payload = AddPayload.model_validate(llm_result.payload)
             _, image_bytes, hash, ext, _ = meme_reciev
             
             new_meme = Meme(
                 hash=hash,
                 ext=ext,
-                short_term=payload.get("short_term"),
-                tags=payload.get("tags", []),
-                prompt=payload.get("prompt")
+                short_term=payload.short_term,
+                tags=payload.tags,
+                prompt=payload.prompt
             )
             meme_store.add_meme(new_meme, image_bytes)
             meme_reciev = None # 清空缓存
             await finish_and_throttle(matcher, response_msg or "表情已添加。")
 
-        elif action == "SEARCH_MEME":
-            hash = payload.get("hash")
-            if not hash:
-                await finish_and_throttle(matcher, response_msg or "没有在数据库里找到合适的表情呢。")
-                return
-
-            meme = meme_store.get_meme(hash)
+        elif action == Action.SEARCH_MEME:
+            payload = SearchPayload.model_validate(llm_result.payload)
+            meme = meme_store.get_meme(payload.hash)
+            
             if meme:
                 image_path = meme_store.get_meme_image_path(meme.hash, meme.ext)
                 if image_path:
                     await matcher.send(MessageSegment.image(image_path.as_uri()))
-                    meme_store.update_meme(meme.hash, usage_count=meme.usage_count + 1, last_used=datetime.now().timestamp())
-                    # 搜索成功后，LLM可以决定是否追加一条消息
+                    meme_store.update_meme(meme.hash, usage_count=meme.usage_count + 1, last_used=time())
                     if response_msg:
                         await finish_and_throttle(matcher, response_msg)
                 else:
@@ -264,33 +303,22 @@ async def process_llm_response(matcher: Matcher, llm_output: str):
             else:
                 await finish_and_throttle(matcher, response_msg or "数据库记录和你说的表情对不上号呢。")
 
-        elif action == "UPDATE_MEME":
-            hash = payload.get("hash")
-            update_data = payload.get("update_data")
-            if not hash or not update_data:
-                await finish_and_throttle(matcher, "更新指令缺少hash或更新数据。")
-                return
-            meme_store.update_meme(hash, **update_data)
+        elif action == Action.UPDATE_MEME:
+            payload = UpdatePayload.model_validate(llm_result.payload)
+            meme_store.update_meme(payload.hash, **payload.update_data)
             await finish_and_throttle(matcher, response_msg or "表情已更新。")
 
-        elif action == "DELETE_MEME":
-            hash = payload.get("hash")
-            if not hash:
-                await finish_and_throttle(matcher, "删除指令缺少hash。")
-                return
-            meme_store.delete_meme(hash)
+        elif action == Action.DELETE_MEME:
+            payload = DeletePayload.model_validate(llm_result.payload)
+            meme_store.delete_meme(payload.hash)
             await finish_and_throttle(matcher, response_msg or "表情已删除。")
 
-        elif action == "NO_ACTION":
-            # 只有当LLM显式提供了回复时才响应，避免无关回复
+        elif action == Action.NO_ACTION:
             if response_msg:
                 await finish_and_throttle(matcher, response_msg)
 
-        else:
-            await finish_and_throttle(matcher, f"无法识别的action: {action}")
-
-    except json.JSONDecodeError:
-        logger.error(f"Failed to parse LLM response: {llm_output}")
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"Failed to parse LLM response: {e}\nRaw output: {llm_output}")
         await matcher.send("LLM响应解析失败，请检查后台日志。")
         await finish_and_throttle(matcher, f"原始输出:\n{llm_output}")
     except Exception as e:
