@@ -140,12 +140,17 @@ class MemeManagerStore():
             self.save()
         else:
             logger.warning(f"Meme with hash {hash} not found, cannot delete.")
+
     def get_meme_by_short_term(self, short_term: str) -> Meme | None:
         for meme in self.memes.values():
             if meme.short_term == short_term:
                 return meme
         logger.warning(f"Meme with short_term {short_term} not found.")
         return None
+
+    def get_memes_as_json_string(self) -> str:
+        """将表情包数据库序列化为JSON字符串"""
+        return json.dumps({k: v.model_dump(exclude={"hash"}) for k, v in self.memes.items()}, ensure_ascii=False)
 
 meme_store = MemeManagerStore()
             
@@ -240,10 +245,12 @@ async def process_llm_response(matcher: Matcher, llm_output: str):
             await finish_and_throttle(matcher, response_msg or "表情已添加。")
 
         elif action == "SEARCH_MEME":
-            meme = None
-            if payload.get("short_term"):
-                meme = meme_store.get_meme_by_short_term(payload["short_term"])
-            
+            hash = payload.get("hash")
+            if not hash:
+                await finish_and_throttle(matcher, response_msg or "没有在数据库里找到合适的表情呢。")
+                return
+
+            meme = meme_store.get_meme(hash)
             if meme:
                 image_path = meme_store.get_meme_image_path(meme.hash, meme.ext)
                 if image_path:
@@ -255,7 +262,7 @@ async def process_llm_response(matcher: Matcher, llm_output: str):
                 else:
                     await finish_and_throttle(matcher, "找到了表情记录，但图片文件丢失了！")
             else:
-                await finish_and_throttle(matcher, response_msg or "没有找到对应的表情包呢。")
+                await finish_and_throttle(matcher, response_msg or "数据库记录和你说的表情对不上号呢。")
 
         elif action == "UPDATE_MEME":
             hash = payload.get("hash")
@@ -311,8 +318,8 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
     可用的 "操作名称" 及其 "payload" 结构:
     - "ADD_MEME": 保存一个新表情包。
       - payload: {"short_term": "可选的简称", "tags": ["标签", "列表"], "prompt": "可选的触发词"}
-    - "SEARCH_MEME": 查找并发送一个表情包。
-      - payload: {"short_term": "简称", "tags": ["标签", "列表"]}
+    - "SEARCH_MEME": 查找并发送一个表情包。LLM需要根据对话上下文和完整的表情包数据库内容，找出最匹配用户意图的表情包的哈希值。
+      - payload: {"hash": "要发送的表情包哈希"}
     - "UPDATE_MEME": 修改一个已有的表情包。
       - payload: {"hash": "表情包哈希", "update_data": {"short_term": "新简称", "tags": ["新标签"], "prompt": "新触发词"}}
     - "DELETE_MEME": 删除一个表情包。
@@ -361,6 +368,9 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
 
 # 插件源代码:
 {__plugin_meta__.extra['source_code']}
+
+# 当前表情包数据库 (memes.json):
+{meme_store.get_memes_as_json_string()}
 
 # 运行时信息:
 - 当前消息ID: {event.message_id}
