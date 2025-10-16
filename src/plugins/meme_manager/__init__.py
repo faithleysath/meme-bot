@@ -1,7 +1,7 @@
 from nonebot import get_plugin_config, on_message, logger, get_bots
 from nonebot.rule import Rule
 from nonebot.permission import Permission
-from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, MessageSegment
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent, PrivateMessageEvent, MessageSegment
 from nonebot.plugin import PluginMetadata
 from nonebot.matcher import Matcher
 from datetime import datetime
@@ -212,15 +212,10 @@ def permission_wrapper(func):
     return Permission(func)
 
 @permission_wrapper
-async def is_target_user(event: MessageEvent) -> bool:
+async def is_target_user(bot: Bot, event: MessageEvent) -> bool:
     """检查是否为目标用户并节流"""
     if config.meme_listen_user_id is None:
-        bots = get_bots()
-        if not bots:
-            logger.warning("No bots are currently connected.")
-            return False
-        bot_id = int(list(bots.keys())[0])
-        config.meme_listen_user_id = bot_id
+        config.meme_listen_user_id = int(bot.self_id)
     return (event.user_id == config.meme_listen_user_id) and (datetime.now().timestamp() - self_sent_time > config.meme_self_sent_timeout) # 防止bot响应的消息被当成请求，默认为2秒
 
 @rule_wrapper
@@ -229,24 +224,14 @@ async def is_reply_message(event: MessageEvent) -> bool:
     return event.reply is not None
 
 @rule_wrapper
-async def to_me(event: PrivateMessageEvent) -> bool:
+async def to_me(bot: Bot, event: PrivateMessageEvent) -> bool:
     """检查是否为私聊消息"""
-    bots = get_bots()
-    if not bots:
-        logger.warning("No bots are currently connected.")
-        return False
-    bot_id = int(list(bots.keys())[0])
-    return event.target_id == bot_id
+    return event.target_id == int(bot.self_id)
 
 @rule_wrapper
-async def not_to_me(event: MessageEvent) -> bool:
+async def not_to_me(bot: Bot, event: MessageEvent) -> bool:
     """检查是否为非私聊消息"""
-    bots = get_bots()
-    if not bots:
-        logger.warning("No bots are currently connected.")
-        return False
-    bot_id = int(list(bots.keys())[0])
-    return event.target_id != bot_id
+    return event.target_id != int(bot.self_id)
 
 # 监听来自目标用户的私聊消息
 target_private_matcher = on_message(permission=is_target_user, rule=to_me, priority=5)
