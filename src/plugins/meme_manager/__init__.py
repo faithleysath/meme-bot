@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 from enum import Enum
 from time import time
 import re
+import uuid
 
 from pathlib import Path
 
@@ -39,6 +40,7 @@ llm_client = AsyncOpenAI(base_url=config.meme_llm_base_url, api_key=config.meme_
 self_sent_time: float = 0
 meme_reciev: tuple[int, bytes, str, str, float] | None = None # (message_id, image_bytes, image_hash, ext, timestamp)
 meme_manager_lock = asyncio.Lock()
+pending_confirmation: dict | None = None # 待确认的操作
 
 with open(__file__, "r", encoding="utf-8") as f:
     __plugin_meta__.extra["source_code"] = f.read()
@@ -74,6 +76,8 @@ class Action(str, Enum):
     SEARCH_MEME = "SEARCH_MEME"
     UPDATE_MEME = "UPDATE_MEME"
     DELETE_MEME = "DELETE_MEME"
+    CONFIRM_ACTION = "CONFIRM_ACTION"
+    CANCEL_ACTION = "CANCEL_ACTION"
     NO_ACTION = "NO_ACTION"
 
 class AddPayload(BaseModel):
@@ -87,9 +91,17 @@ class SearchPayload(BaseModel):
 class UpdatePayload(BaseModel):
     hash: str
     update_data: dict
+    uuid: str
 
 class DeletePayload(BaseModel):
     hash: str
+    uuid: str
+
+class ConfirmPayload(BaseModel):
+    uuid: str
+
+class CancelPayload(BaseModel):
+    uuid: str
 
 class LLMResult(BaseModel):
     action: Action
@@ -259,9 +271,9 @@ async def call_llm(prompts: list) -> str:
         logger.error(f"LLM call failed: {e}")
         raise
 
-async def process_llm_response(matcher: Matcher, llm_output: str):
+async def process_llm_response(matcher: Matcher, llm_output: str, current_uuid: str):
     """解析LLM的响应并执行相应的操作"""
-    global meme_reciev
+    global meme_reciev, pending_confirmation
     try:
         json_data = extract_json(llm_output)
         llm_result = LLMResult.model_validate(json_data)
@@ -305,13 +317,58 @@ async def process_llm_response(matcher: Matcher, llm_output: str):
 
         elif action == Action.UPDATE_MEME:
             payload = UpdatePayload.model_validate(llm_result.payload)
-            meme_store.update_meme(payload.hash, **payload.update_data)
-            await finish_and_throttle(matcher, response_msg or "表情已更新。")
+            if payload.uuid != current_uuid:
+                await finish_and_throttle(matcher, "操作已过期，请重新发起。")
+                return
+            pending_confirmation = {
+                "uuid": payload.uuid,
+                "action": action.value,
+                "payload": payload.model_dump()
+            }
+            await finish_and_throttle(matcher, response_msg or f"请确认是否要执行更新操作？\nUUID: {payload.uuid}")
 
         elif action == Action.DELETE_MEME:
             payload = DeletePayload.model_validate(llm_result.payload)
-            meme_store.delete_meme(payload.hash)
-            await finish_and_throttle(matcher, response_msg or "表情已删除。")
+            if payload.uuid != current_uuid:
+                await finish_and_throttle(matcher, "操作已过期，请重新发起。")
+                return
+            pending_confirmation = {
+                "uuid": payload.uuid,
+                "action": action.value,
+                "payload": payload.model_dump()
+            }
+            await finish_and_throttle(matcher, response_msg or f"请确认是否要执行删除操作？\nUUID: {payload.uuid}")
+
+        elif action == Action.CONFIRM_ACTION:
+            payload = ConfirmPayload.model_validate(llm_result.payload)
+            if not pending_confirmation or pending_confirmation["uuid"] != payload.uuid:
+                await finish_and_throttle(matcher, "没有找到待确认的操作或UUID不匹配。")
+                return
+            
+            # 执行暂存的操作
+            pending_action_str = pending_confirmation["action"]
+            pending_action = Action(pending_action_str)
+            pending_payload = pending_confirmation["payload"]
+            
+            if pending_action == Action.UPDATE_MEME:
+                update_payload = UpdatePayload.model_validate(pending_payload)
+                meme_store.update_meme(update_payload.hash, **update_payload.update_data)
+                await finish_and_throttle(matcher, response_msg or "表情已更新。")
+            
+            elif pending_action == Action.DELETE_MEME:
+                delete_payload = DeletePayload.model_validate(pending_payload)
+                meme_store.delete_meme(delete_payload.hash)
+                await finish_and_throttle(matcher, response_msg or "表情已删除。")
+            
+            pending_confirmation = None # 清空状态
+
+        elif action == Action.CANCEL_ACTION:
+            payload = CancelPayload.model_validate(llm_result.payload)
+            if pending_confirmation and pending_confirmation["uuid"] == payload.uuid:
+                pending_confirmation = None
+                await finish_and_throttle(matcher, response_msg or "操作已取消。")
+            else:
+                await finish_and_throttle(matcher, "没有找到需要取消的操作或UUID不匹配。")
 
         elif action == Action.NO_ACTION:
             if response_msg:
@@ -334,6 +391,12 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
     LLM被期望分析用户的文本、附带的图片（如有），以及上下文，
     然后返回一个JSON对象来指令本插件如何操作表情包数据库。
 
+    工作流程:
+    1.  对于`UPDATE_MEME`和`DELETE_MEME`操作，LLM必须返回当前交互的`uuid`。插件会暂存此操作并向用户请求确认。
+    2.  用户通过**回复**该确认消息来发送“确认”或“取消”指令。
+    3.  LLM需要从用户回复的原文（即插件发送的确认消息）中提取出`uuid`，然后生成`CONFIRM_ACTION`或`CANCEL_ACTION`并附带上这个提取出的`uuid`。
+    4.  插件校验UUID后，执行或取消操作。
+
     LLM返回的JSON格式规范:
     {
       "action": "操作名称",
@@ -346,12 +409,16 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
     可用的 "操作名称" 及其 "payload" 结构:
     - "ADD_MEME": 保存一个新表情包。
       - payload: {"short_term": "可选的简称", "tags": ["标签", "列表"], "prompt": "可选的触发词"}
-    - "SEARCH_MEME": 查找并发送一个表情包。LLM需要根据对话上下文和完整的表情包数据库内容，找出最匹配用户意图的表情包的哈希值。
+    - "SEARCH_MEME": 查找并发送一个表情包。
       - payload: {"hash": "要发送的表情包哈希"}
-    - "UPDATE_MEME": 修改一个已有的表情包。
-      - payload: {"hash": "表情包哈希", "update_data": {"short_term": "新简称", "tags": ["新标签"], "prompt": "新触发词"}}
-    - "DELETE_MEME": 删除一个表情包。
-      - payload: {"hash": "表情包哈希"}
+    - "UPDATE_MEME": **提议**修改一个已有的表情包，等待用户确认。
+      - payload: {"hash": "表情包哈希", "update_data": {...}, "uuid": "当前交互UUID"}
+    - "DELETE_MEME": **提议**删除一个表情包，等待用户确认。
+      - payload: {"hash": "表情包哈希", "uuid": "当前交互UUID"}
+    - "CONFIRM_ACTION": 确认执行暂存的操作。
+      - payload: {"uuid": "待确认操作的UUID"}
+    - "CANCEL_ACTION": 取消暂存的操作。
+      - payload: {"uuid": "待确认操作的UUID"}
     - "NO_ACTION": 用户只是在闲聊或指令无法识别。
       - payload: {}
     """
@@ -390,6 +457,8 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
         
         # 检查缓存图片是否过期
         image_enable = meme_reciev is not None and (datetime.now().timestamp() - meme_reciev[4] <= MERGE_TIME_WINDOW)
+        
+        current_uuid = str(uuid.uuid4())
 
         # 构建提示词
         prompt = f"""你是一个qq机器人插件的运行组成部分。请你理解插件的运行原理，分析用户的意图，并严格按照 handle_target_private 函数文档字符串中定义的格式返回一个JSON字符串，使得插件能正确运行。
@@ -401,6 +470,7 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
 {meme_store.get_memes_as_json_string()}
 
 # 运行时信息:
+- 当前交互UUID: {current_uuid}
 - 当前消息ID: {event.message_id}
 - 回复的消息ID(如有): {event.reply.message_id if event.reply else "无"}
 - 用户的当前消息: "{current_msg_text}"
@@ -428,7 +498,7 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
 
         try:
             llm_output = await call_llm(prompts)
-            await process_llm_response(matcher, llm_output)
+            await process_llm_response(matcher, llm_output, current_uuid)
         except Exception as e:
             await finish_and_throttle(matcher, f"LLM调用失败: {e}")
             return
