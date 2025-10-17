@@ -3,6 +3,7 @@ from nonebot.rule import Rule
 from nonebot.permission import Permission
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, PrivateMessageEvent, MessageSegment, Message
 from nonebot.plugin import PluginMetadata
+from nonebot.exception import FinishedException
 from nonebot.matcher import Matcher
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -24,7 +25,7 @@ require("nonebot_plugin_localstore")
 
 import nonebot_plugin_localstore as store
 
-from .config import Config
+from .config import Config # type: ignore
 
 __plugin_meta__ = PluginMetadata(
     name="meme-manager",
@@ -84,6 +85,7 @@ class AddPayload(BaseModel):
     short_term: str | None = None
     tags: list[str] = Field(default_factory=list)
     prompt: str | None = None
+    description: str | None = None
 
 class SearchPayload(BaseModel):
     hash: str
@@ -106,7 +108,7 @@ class CancelPayload(BaseModel):
 class LLMResult(BaseModel):
     action: Action
     payload: dict = Field(default_factory=dict)
-    response: str | None = None
+    response: str | None = None # 对用户的友好回复
 
 class MemeManagerStore():
     def __init__(self):
@@ -154,6 +156,13 @@ class MemeManagerStore():
         """获取表情图片文件的路径"""
         image_file = self.image_storage_path / f"{hash}.{ext}"
         return image_file if image_file.exists() else None
+    
+    def get_meme_image_bytes(self, hash: str, ext: str) -> bytes | None:
+        """获取表情图片文件的字节内容"""
+        image_path = self.get_meme_image_path(hash, ext)
+        if image_path:
+            return image_path.read_bytes()
+        return None
 
     def delete_meme_image(self, hash: str, ext: str):
         """删除表情图片文件"""
@@ -276,7 +285,8 @@ async def process_llm_response(matcher: Matcher, llm_output: str, current_uuid: 
                 ext=ext,
                 short_term=payload.short_term,
                 tags=payload.tags,
-                prompt=payload.prompt
+                prompt=payload.prompt,
+                description=payload.description
             )
             meme_store.add_meme(new_meme, image_bytes)
             meme_reciev = None # 清空缓存
@@ -287,12 +297,14 @@ async def process_llm_response(matcher: Matcher, llm_output: str, current_uuid: 
             meme = meme_store.get_meme(payload.hash)
             
             if meme:
-                image_path = meme_store.get_meme_image_path(meme.hash, meme.ext)
-                if image_path:
-                    await matcher.send(MessageSegment.image(image_path.as_uri()))
-                    meme_store.update_meme(meme.hash, usage_count=meme.usage_count + 1, last_used=time())
-                    if response_msg:
-                        await finish_and_throttle(matcher, response_msg)
+                image_bytes = meme_store.get_meme_image_bytes(meme.hash, meme.ext)
+                if image_bytes:
+                    # 构造图文消息
+                    image_segment = MessageSegment.image(image_bytes, type_=meme.ext)
+                    text_segment = MessageSegment.text(response_msg or f"这是你要找的表情包！")
+                    message = Message([image_segment, text_segment])
+                    # 发送消息
+                    await finish_and_throttle(matcher, message)
                 else:
                     await finish_and_throttle(matcher, "找到了表情记录，但图片文件丢失了！")
             else:
@@ -361,6 +373,8 @@ async def process_llm_response(matcher: Matcher, llm_output: str, current_uuid: 
         logger.error(f"Failed to parse LLM response: {e}\nRaw output: {llm_output}")
         await matcher.send("LLM响应解析失败，请检查后台日志。")
         await finish_and_throttle(matcher, f"原始输出:\n{llm_output}")
+    except FinishedException:
+        raise
     except Exception as e:
         logger.error(f"An error occurred in handler: {e}")
         await finish_and_throttle(matcher, f"处理时发生未知错误: {e}")
@@ -386,12 +400,12 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
       "payload": {
         // 操作所需的数据
       },
-      "response": "一句对用户的友好回复，在闲聊时也应提供此字段"
+      "response": "对用户的友好回复，在闲聊时也应提供此字段"
     }
 
     可用的 "操作名称" 及其 "payload" 结构:
     - "ADD_MEME": 保存一个新表情包。
-      - payload: {"short_term": "可选的简称", "tags": ["标签", "列表"], "prompt": "可选的触发词"}
+      - payload: {"short_term": "可选的简称", "tags": ["标签", "列表"], "prompt": "可选的触发词", "description": "可选的描述"}
     - "SEARCH_MEME": 查找并发送一个表情包。
       - payload: {"hash": "要发送的表情包哈希"}
     - "UPDATE_MEME": **提议**修改一个已有的表情包，等待用户确认。
@@ -483,7 +497,11 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
 
         try:
             llm_output = await call_llm(prompts)
+            logger.debug(f"LLM output: {llm_output}")
             await process_llm_response(matcher, llm_output, current_uuid)
+        except FinishedException:
+            raise
         except Exception as e:
+            logger.error(f"LLM call or processing failed: {e}")
             await finish_and_throttle(matcher, f"LLM调用失败: {e}")
             return
