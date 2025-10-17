@@ -7,4 +7,4 @@ class Config(BaseModel):
     meme_self_sent_timeout: int = 2 # 插件忽略自身消息的时间窗口，单位为秒
     meme_llm_base_url: str = "https://api.openai.com/v1" # LLM模型的基础URL
     meme_llm_api_key: str = "" # LLM模型的API Key
-    meme_llm_model: str = "gpt-3.5-turbo" # LLM模型名称
+    meme_llm_model: str = "google/gemini-2.5-flash" # LLM模型名称
