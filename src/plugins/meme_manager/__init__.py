@@ -420,7 +420,7 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
       - payload: {}
     """
     global meme_reciev
-    MERGE_TIME_WINDOW = 10 # 合并时间窗口，单位为秒
+    MERGE_TIME_WINDOW = 20 # 合并时间窗口，单位为秒
     async with meme_manager_lock:
         image_segment: MessageSegment | None = None
         # 检查图片数量
@@ -448,6 +448,9 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
 
         # 获取并合并可能存在的引用消息的纯文本内容
         current_msg_text = event.message.extract_plain_text().strip()
+        if not current_msg_text:
+            # 提前终止
+            return
         reply_msg_text = ""
         if event.reply is not None:
             reply_msg_text = event.reply.message.extract_plain_text().strip()
