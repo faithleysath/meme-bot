@@ -1,7 +1,7 @@
-from nonebot import get_plugin_config, on_message, logger, get_bots
+from nonebot import get_plugin_config, on_message, logger
 from nonebot.rule import Rule
 from nonebot.permission import Permission
-from nonebot.adapters.onebot.v11 import Bot, MessageEvent, PrivateMessageEvent, MessageSegment
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent, PrivateMessageEvent, MessageSegment, Message
 from nonebot.plugin import PluginMetadata
 from nonebot.matcher import Matcher
 from datetime import datetime
@@ -33,7 +33,7 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
 )
 
-config: Config = cast(Config, get_plugin_config(Config))
+config: Config = cast(Config, get_plugin_config(Config)) # type: ignore
 
 llm_client = AsyncOpenAI(base_url=config.meme_llm_base_url, api_key=config.meme_llm_api_key)
 
@@ -236,7 +236,7 @@ async def not_to_me(bot: Bot, event: MessageEvent) -> bool:
 # 监听来自目标用户的私聊消息
 target_private_matcher = on_message(permission=is_target_user, rule=to_me, priority=5)
 
-async def finish_and_throttle(matcher: Matcher, message: str):
+async def finish_and_throttle(matcher: Matcher, message: str | Message):
     global self_sent_time
     self_sent_time = datetime.now().timestamp()
     await matcher.finish(message)
@@ -244,14 +244,12 @@ async def finish_and_throttle(matcher: Matcher, message: str):
 async def call_llm(prompts: list) -> str:
     """调用LLM并返回其原始输出"""
     try:
-        resp = await llm_client.responses.create(
+        resp = await llm_client.chat.completions.create(
             model=config.meme_llm_model,
-            input=prompts,  # type: ignore
+            messages=prompts,
         )
-        # 假设响应对象有 output_text 属性，根据用户反馈进行调整
-        if hasattr(resp, "output_text"):
-            return resp.output_text
-        raise ValueError("无法从LLM响应中提取文本内容，响应对象缺少'output_text'属性")
+        content = resp.choices[0].message.content
+        return content if content is not None else ""
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         raise
@@ -466,20 +464,22 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
 - 缓存图片的扩展名(如有): {meme_reciev[3] if image_enable and meme_reciev else "无"}
 """
 
-        prompts = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                ]
-            }
-        ]
-
+        content_list: list[dict] = [{"type": "text", "text": prompt}]
         if image_enable:
             assert meme_reciev is not None
             image_bytes = meme_reciev[1]
             ext = meme_reciev[3]
-            prompts[0]['content'].append({"type": "input_image", "image_url": b2s64(image_bytes, ext)})
+            content_list.append({
+                "type": "image_url",
+                "image_url": {"url": b2s64(image_bytes, ext)}
+            })
+
+        prompts = [
+            {
+                "role": "user",
+                "content": content_list
+            }
+        ]
 
         try:
             llm_output = await call_llm(prompts)
