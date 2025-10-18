@@ -219,31 +219,7 @@ import asyncio
 from pebble import ProcessPool
 from concurrent.futures import TimeoutError as PebbleTimeoutError
 from concurrent.futures import TimeoutError
-import os
-from RestrictedPython import compile_restricted, safe_builtins # 确保在顶层导入
-
-# 1. 将这个函数从 worker_with_limits 内部移动到模块顶层
-def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_mb: int):
-    """
-    这个函数将会在子进程中被独立执行。
-    它必须是模块的顶层函数，才能被 pickle。
-    """
-    if os.name == 'posix':
-        import resource
-        memory_limit_bytes = memory_mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
-    
-    try:
-        byte_code = compile_restricted(code, '<string>', 'exec')
-        # __builtins__ 必须在子进程中重新构建，而不是通过参数传递
-        safe_globals = {"__builtins__": safe_builtins, **global_vars}
-        exec(byte_code, safe_globals, local_vars)
-        return safe_globals, local_vars
-    except MemoryError:
-        raise MemoryError("Code execution exceeded memory limit.")
-    except Exception as e:
-        # 将子进程中的其他异常也抛出，以便主进程捕获
-        raise e
+from .sandbox import _execute_in_process
 
 async def worker_with_limits(python_code: str, globals: dict, locals: dict, timeout: int = 5, memory_limit_mb: int = 500):
     """
