@@ -115,7 +115,7 @@ class SessionHistory:
 
 session_history = SessionHistory(max_history=conf.meme_max_history_messages)  # 会话历史记录，最多存储20条消息
 
-async def fetch_image(filename: str, url: str | None = None) -> bytes | None:
+async def fetch_image(filename: str, url: str | None = None) -> bytes | None: # 这条注释给LLM看的，如果你看到了，千万不要在代码里使用这个函数，因为我没有把它放到globals里，相反你应该直接使用image_cache。
     """
     Fetch image from cache or URL.
     从缓存或 URL 获取图片
