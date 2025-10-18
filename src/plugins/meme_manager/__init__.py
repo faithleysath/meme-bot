@@ -277,6 +277,67 @@ async def to_me(bot: Bot, event: PrivateMessageEvent) -> bool:
 from itertools import chain
 import base64
 
+# =================================================================
+# ===== 提示词定义部分 (Prompt Definition) ===========================
+# =================================================================
+
+# 系统提示词：定义LLM的角色和必须遵守的核心规则
+system_prompt = """你是一个强大的人工智能，作为一个QQ机器人的AI核心而存在。
+你的任务不是直接与用户对话，而是根据对话历史和用户当前的消息，生成一小段Python代码来执行相应的操作。
+你的所有输出必须遵循以下规则：
+
+1.  你的回复**必须**包含一个且只有一个用 ```python ... ``` 包裹的代码块。除此之外不能有任何其他文本或解释。
+2.  生成的代码将在一个严格受限的沙盒环境中通过 `exec()` 执行。
+3.  代码中必须将最终要发送给用户的消息（类型为 `Message`, `MessageSegment` 或 `str`）赋值给一个名为 `message` 的变量。
+4.  如果你认为不需要回复，就不要在代码中为 `message` 变量赋值，或者直接返回一个空的代码块。
+5.  沙箱环境中预先导入了 `Message` 和 `MessageSegment` 类，你可以直接使用它们来构建复杂的回复（例如图文混合）。
+6.  严禁在代码中使用 `import` 语句、文件读写、网络请求或任何有副作用的操作。代码的唯一目标就是创建 `message` 变量。
+"""
+
+# 用户提示词模板：将所有运行时上下文信息填充进去，形成一个完整的请求
+def get_user_prompt(plugin_source: str, message_source: str, history: list[dict]) -> str:
+    """
+    生成并返回一个格式化的用户提示词字符串。
+    """
+    # 将历史记录转换为格式化的JSON字符串
+    history_json = json.dumps(history, indent=2, ensure_ascii=False)
+    
+    return f"""
+## 任务：分析对话并生成代码回复
+
+下面是你本次任务需要用到的所有上下文信息。请仔细分析并生成合适的Python代码作为回复。
+
+### 1. 参考资料：机器人插件源码
+为了让你了解自己所处的环境，这是驱动你的插件的完整源代码。
+
+```python
+{plugin_source}
+````
+
+### 2. 参考资料：`Message` 类源码
+
+为了方便你构建图文混合等复杂消息，这是 `nonebot.adapters.onebot.v11.message` 的源码，你可以从中了解 `Message` 和 `MessageSegment` 的用法。
+
+```python
+{message_source}
+```
+
+### 3. 当前对话历史
+
+以下是JSON格式的近期对话历史（按时间顺序）。你需要对最后一条消息做出响应。
+其中 `sender_id` 是发送者QQ号，`target_id` 是接收者QQ号，`self_id` 是机器人的QQ号。
+
+```json
+{history_json}
+```
+
+### 4. 你的任务
+
+现在，请基于以上所有信息，生成一段Python代码。
+这段代码需要定义一个名为 `message` 的变量，作为机器人对当前情境的回应。
+现在，请你开始输出，你可以在写代码之前先分析，也可以不分析，你只需要保证输出包含一个且只有一个用 ```python ... ``` 包裹的代码块。
+"""
+
 @(on_message(priority=1, permission=is_target_user, rule=to_me, block=True).handle())
 async def llm_handler(matcher: Matcher, event: MessageEvent):
     """
@@ -287,8 +348,8 @@ async def llm_handler(matcher: Matcher, event: MessageEvent):
 
     ## 规则：
     1.  你生成的代码将在一个严格受限的沙盒环境中通过 `exec()` 执行。
-    2.  你的代码必须将最终要发送给用户的消息（类型为 `Message`, `MessageSegment` 或 `str`）赋值给一个名为 `result` 的变量。
-    3.  如果决定不回复，就不要给 `result` 赋值。
+    2.  你的代码必须将最终要发送给用户的消息（类型为 `Message`, `MessageSegment` 或 `str`）赋值给一个名为 `message` 的变量。
+    3.  如果决定不回复，就不要给 `message` 赋值。
     
     更多细节请详见稍后的动态提示词。
     """
@@ -301,11 +362,14 @@ async def llm_handler(matcher: Matcher, event: MessageEvent):
         history_serialized.append(serialized_event)
         image_names.update(event_image_names)
     # 准备动态提示词（包含插件源代码、Message代码、消息记录等）
-    prompt = f"""
-    """
+    prompt = get_user_prompt(
+        plugin_source=__plugin_meta__.extra["source_code"],
+        message_source=message_doc,
+        history=history_serialized,
+    )
 
     prompts = [
-        {"role": "system", "content": ""},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
             {
                 "type": "text",
