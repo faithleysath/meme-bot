@@ -97,7 +97,7 @@ async def fetch_image(filename: str, url: str | None = None) -> bytes | None:
     if url:
         try:
             async with AsyncSession() as session:
-                response = await session.get(url)
+                response = await session.get(url, timeout=10)
                 if response.status_code == 200:
                     image_data = response.content
                     # 存入缓存
@@ -107,7 +107,7 @@ async def fetch_image(filename: str, url: str | None = None) -> bytes | None:
             logger.error(f"Error fetching image from URL {url}: {e}")
     return None
 
-async def segments_to_dicts(segments: MessageSegment | list[MessageSegment] | Message) -> tuple[list[dict], set[str]]:
+async def serialize_segments_with_images(segments: MessageSegment | list[MessageSegment] | Message) -> tuple[list[dict], set[str]]:
     """
     Convert MessageSegment or list of MessageSegment to a dictionary.
     将 MessageSegment 或 MessageSegment 列表转换为字典，仅转换特定类型
@@ -131,13 +131,13 @@ async def segments_to_dicts(segments: MessageSegment | list[MessageSegment] | Me
                 continue
     return result, image_names
 
-async def message_event_to_dict(event: MessageEvent) -> tuple[dict, set[str]]:
+async def serialize_message_event_with_images(event: MessageEvent) -> tuple[dict, set[str]]:
     """
     Convert MessageEvent to a dictionary.
     将 MessageEvent 转换为字典
     """
 
-    message, image_names = await segments_to_dicts(event.message)
+    message, image_names = await serialize_segments_with_images(event.message)
 
     result = {
         "event_type": event.post_type, # 事件类型
@@ -152,7 +152,7 @@ async def message_event_to_dict(event: MessageEvent) -> tuple[dict, set[str]]:
     }
 
     if event.reply:
-        reply_message, reply_image_names = await segments_to_dicts(event.reply.message)
+        reply_message, reply_image_names = await serialize_segments_with_images(event.reply.message)
         result["reply_to"] = { # 被回复的消息信息
             "time": datetime.fromtimestamp(event.reply.time).isoformat(),
             "message_type": event.reply.message_type,
