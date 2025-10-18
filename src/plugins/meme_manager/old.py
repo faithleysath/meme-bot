@@ -50,13 +50,6 @@ def b2s64(image_bytes: bytes, ext: str) -> str:
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/{ext};base64,{encoded}"
 
-def extract_json(text: str) -> dict:
-    """从可能被三引号等包裹的文本中提取出JSON对象"""
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if not match:
-        raise ValueError("在文本中未找到JSON对象")
-    return json.loads(match.group(0))
-
 class Meme(BaseModel):
     hash: str # 这里用md5哈希作为唯一标识
     pHash: str | None = None # 感知哈希，用于相似图片搜索
@@ -250,25 +243,28 @@ async def finish_and_throttle(matcher: Matcher, message: str | Message):
     self_sent_time = datetime.now().timestamp()
     await matcher.finish(message)
 
-async def call_llm(prompts: list) -> str:
+async def call_llm(prompts: list) -> LLMResult:
     """调用LLM并返回其原始输出"""
     try:
-        resp = await llm_client.chat.completions.create(
+        resp = await llm_client.beta.chat.completions.parse(
             model=config.meme_llm_model,
             messages=prompts,
+            response_format=LLMResult,
         )
-        content = resp.choices[0].message.content
-        return content if content is not None else ""
+        parsed_result = resp.choices[0].message.parsed
+        if parsed_result is None:
+            raw_content = resp.choices[0].message.content or ""
+            logger.error(f"LLM response could not be parsed into LLMResult model. Raw content: {raw_content}")
+            raise ValueError("LLM响应无法解析为LLMResult模型。")
+        return parsed_result
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         raise
 
-async def process_llm_response(matcher: Matcher, llm_output: str, current_uuid: str):
+async def process_llm_response(matcher: Matcher, llm_result: LLMResult, current_uuid: str):
     """解析LLM的响应并执行相应的操作"""
     global meme_reciev, pending_confirmation
     try:
-        json_data = extract_json(llm_output)
-        llm_result = LLMResult.model_validate(json_data)
         action = llm_result.action
         response_msg = llm_result.response
 
@@ -369,10 +365,6 @@ async def process_llm_response(matcher: Matcher, llm_output: str, current_uuid: 
             if response_msg:
                 await finish_and_throttle(matcher, response_msg)
 
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Failed to parse LLM response: {e}\nRaw output: {llm_output}")
-        await matcher.send("LLM响应解析失败，请检查后台日志。")
-        await finish_and_throttle(matcher, f"原始输出:\n{llm_output}")
     except FinishedException:
         raise
     except Exception as e:
@@ -499,9 +491,9 @@ async def handle_target_private(matcher: Matcher, event: PrivateMessageEvent):
         ]
 
         try:
-            llm_output = await call_llm(prompts)
-            logger.debug(f"LLM output: {llm_output}")
-            await process_llm_response(matcher, llm_output, current_uuid)
+            llm_result = await call_llm(prompts)
+            logger.debug(f"LLM result: {llm_result.model_dump_json(indent=2, ensure_ascii=False)}")
+            await process_llm_response(matcher, llm_result, current_uuid)
         except FinishedException:
             raise
         except Exception as e:

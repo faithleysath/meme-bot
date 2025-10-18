@@ -2,7 +2,7 @@ import asyncio
 import websockets
 
 # 定义服务器的主机和端口
-HOST = '192.168.1.199'
+HOST = '198.18.0.1'
 PORT = 8080
 
 async def handler(websocket):
