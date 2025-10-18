@@ -56,7 +56,7 @@ class SessionHistory:
         self.max_history = max_history
         self._history: dict[int, deque[MessageEvent]] = {}
 
-    def put_event(self, session_id: int, event: MessageEvent):
+    def add_event(self, session_id: int, event: MessageEvent):
         """将事件添加到指定会话的历史记录中"""
         if session_id not in self._history:
             self._history[session_id] = deque(maxlen=self.max_history)
@@ -77,9 +77,7 @@ class SessionHistory:
     def __getitem__(self, key: int) -> list[MessageEvent]:
         return self.get_history(key)
     def __setitem__(self, key: int, value: list[MessageEvent]):
-        self.clear_history(key)
-        for event in value:
-            self.put_event(key, event)
+        self._history[key] = deque(value, maxlen=self.max_history)
     # 重载一些运算符
     def __len__(self) -> int:
         return len(self._history)
@@ -167,13 +165,7 @@ async def message_event_to_dict(event: MessageEvent) -> tuple[dict, set[str]]:
 
     return result, image_names
 
-meme_manager_event = on_message(priority=5)
-
-@meme_manager_event.handle()
-async def handle_meme_manager_event(event: MessageEvent):
-    """
-    Handle meme manager related events.
-    处理 meme 管理器相关事件
-    """
-    event_dict = await message_event_to_dict(event)
-    logger.debug(f"Meme Manager Event: {event_dict}")
+@(on_message(priority=0, block=False).handle())
+async def record_message(event: MessageEvent):
+    """记录每条消息到会话历史中"""
+    session_history.add_event(event.target_id, event)
