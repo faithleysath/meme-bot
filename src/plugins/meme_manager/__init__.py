@@ -18,6 +18,7 @@ from nonebot.matcher import Matcher
 from nonebot.exception import FinishedException
 from curl_cffi import AsyncSession, CurlError
 import asyncio
+import json
 
 from openai import AsyncClient, NotFoundError, APIStatusError, RateLimitError, APITimeoutError, BadRequestError, APIConnectionError, AuthenticationError, InternalServerError, PermissionDeniedError
 
@@ -273,9 +274,99 @@ async def to_me(bot: Bot, event: PrivateMessageEvent) -> bool:
     """检查是否为私聊消息"""
     return event.target_id == int(bot.self_id)
 
+from itertools import chain
+import base64
+
 @(on_message(priority=1, permission=is_target_user, rule=to_me, block=True).handle())
 async def llm_handler(matcher: Matcher, event: MessageEvent):
     """
     处理来自目标用户的消息，调用 LLM 生成回复
     《告LLM书》
+    尊敬的大语言模型，当你读到这段话时，你大概已经理解了你所处的环境和任务。是的，你是一个强大的人工智能助手，负责驱动一个基于 NoneBot V11 的 QQ 机器人。
+    你的任务不是直接与用户对话，而是根据对话历史和用户当前的消息，生成一小段 Python 代码来执行相应的操作（你可以不光返回代码，只需要保证你的返回有且仅有一段用```python```包裹的代码块就行）。
+
+    ## 规则：
+    1.  你生成的代码将在一个严格受限的沙盒环境中通过 `exec()` 执行。
+    2.  你的代码必须将最终要发送给用户的消息（类型为 `Message`, `MessageSegment` 或 `str`）赋值给一个名为 `result` 的变量。
+    3.  如果决定不回复，就不要给 `result` 赋值。
+    
+    更多细节请详见稍后的动态提示词。
     """
+    # 准备消息历史（已经包含当前消息）
+    history_events = session_history.get_history(event.target_id)
+    image_names: set[str] = set()
+    history_serialized: list[dict] = []
+    for hist_event in history_events:
+        serialized_event, event_image_names = await serialize_message_event_with_images(hist_event)
+        history_serialized.append(serialized_event)
+        image_names.update(event_image_names)
+    # 准备动态提示词（包含插件源代码、Message代码、消息记录等）
+    prompt = f"""
+    """
+
+    prompts = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": [
+            {
+                "type": "text",
+                "text": prompt
+            },
+            {
+                "type": "text",
+                "text": "附录：以下是包含到的一些图片。"
+            },
+            *list(chain.from_iterable([
+                (
+                    {
+                        "type": "text", 
+                        "text": f"图片文件名：{name}"
+                    }, 
+                    {
+                        "type": "image_url", 
+                        "image_url": {
+                            "url": f"data:image/{name.split('.')[-1]};base64,{base64.b64encode(data).decode('utf-8')}"
+                        }
+                    }) 
+                for name in image_names if (data:= await fetch_image(name))
+                ]
+            )),
+        ]}
+    ]
+
+    # 调用 LLM 接口
+    llm_response = await call_llm_with_retry(prompts)
+    if isinstance(llm_response, Exception) or not llm_response:
+        await finish_and_throttle(matcher, f"调用 LLM 接口时出错：{llm_response}")
+        return
+    logger.debug(f"LLM Response: {llm_response}")
+    # 从 LLM 响应中提取 Python 代码块
+    import re
+    code_blocks = re.findall(r"```python(.*?)```", llm_response, re.DOTALL | re.IGNORECASE)
+    if not code_blocks:
+        await finish_and_throttle(matcher, "LLM 未返回有效的 Python 代码块。")
+        return
+    python_code = code_blocks[0].strip()
+    # 在受限沙盒中执行代码
+    try:
+        safe_globals = {
+            "Message": Message,
+            "MessageSegment": MessageSegment,
+        }
+        safe_locals = {}
+        g, l = await worker_with_limits(
+            python_code=python_code,
+            globals=safe_globals,
+            locals=safe_locals,
+            timeout=conf.meme_sandbox_code_timeout,
+            memory_limit_mb=conf.meme_sandbox_code_memory_limit_mb,
+        )
+        if "message" in l:
+            await finish_and_throttle(matcher, l["message"])
+        else:
+            await finish_and_throttle(matcher, "代码执行完成，但未生成回复消息。")
+    except TimeoutError:
+        await finish_and_throttle(matcher, "代码执行超时，未能生成回复。")
+    except MemoryError:
+        await finish_and_throttle(matcher, "代码执行时内存超限，未能生成回复。")
+    except Exception as e:
+        await finish_and_throttle(matcher, f"代码执行时出错：{e}")
