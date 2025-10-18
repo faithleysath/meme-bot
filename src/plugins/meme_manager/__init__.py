@@ -217,51 +217,63 @@ async def call_llm_with_retry(prompts: list, max_retries: int = 3, delay: float 
 
 import asyncio
 from pebble import ProcessPool
+from concurrent.futures import TimeoutError as PebbleTimeoutError
 from concurrent.futures import TimeoutError
 import os
+from RestrictedPython import compile_restricted, safe_builtins # 确保在顶层导入
+
+# 1. 将这个函数从 worker_with_limits 内部移动到模块顶层
+def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_mb: int):
+    """
+    这个函数将会在子进程中被独立执行。
+    它必须是模块的顶层函数，才能被 pickle。
+    """
+    if os.name == 'posix':
+        import resource
+        memory_limit_bytes = memory_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+    
+    try:
+        byte_code = compile_restricted(code, '<string>', 'exec')
+        # __builtins__ 必须在子进程中重新构建，而不是通过参数传递
+        safe_globals = {"__builtins__": safe_builtins, **global_vars}
+        exec(byte_code, safe_globals, local_vars)
+        return safe_globals, local_vars
+    except MemoryError:
+        raise MemoryError("Code execution exceeded memory limit.")
+    except Exception as e:
+        # 将子进程中的其他异常也抛出，以便主进程捕获
+        raise e
 
 async def worker_with_limits(python_code: str, globals: dict, locals: dict, timeout: int = 5, memory_limit_mb: int = 500):
-    """在子进程中执行受限的 Python 代码，并通过 asyncio.to_thread 桥接阻塞操作"""
-    
-    def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_mb: int):
-        """这个函数将会在子进程中执行，它本身是同步阻塞的"""
-        from RestrictedPython import compile_restricted, safe_builtins
-        if os.name == 'posix':
-            import resource
-            memory_limit_bytes = memory_mb * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
-        
-        try:
-            byte_code = compile_restricted(code, '<string>', 'exec')
-            safe_globals = {"__builtins__": safe_builtins, **global_vars}
-            exec(byte_code, safe_globals, local_vars)
-            return safe_globals, local_vars
-        except MemoryError:
-            raise MemoryError("Code execution exceeded memory limit.")
-
+    """
+    使用 pebble 内建的 timeout 功能来管理子进程的生命周期，代码更简洁。
+    """
     with ProcessPool(max_workers=1) as pool:
-        # 1. 提交任务到进程池，这是非阻塞的，它会立即返回一个 future 对象
+        # 1. 在调度任务时，直接传入 timeout 参数
         future = pool.schedule(
-            _execute_in_process, 
+            _execute_in_process,
             kwargs={
-                "code": python_code, 
-                "global_vars": globals, 
-                "local_vars": locals, 
+                "code": python_code,
+                "global_vars": globals,
+                "local_vars": locals,
                 "memory_mb": memory_limit_mb
-            }
+            },
+            timeout=timeout  # <-- 使用这里的 timeout
         )
 
         try:
-            # 2. future.result() 是一个阻塞操作。我们使用 asyncio.to_thread 
-            #    把它扔到后台线程执行，这样就不会阻塞主事件循环了。
-            #    我们 await 的是 to_thread 这个异步操作的结果。
-            result = await asyncio.to_thread(future.result, timeout=timeout)
+            # 2. 像之前一样，在后台线程中等待结果。
+            #    如果 pebble 检测到超时，future.result() 会立即抛出 PebbleTimeoutError。
+            result = await asyncio.to_thread(future.result) # <-- 这里不再需要 timeout
             return result
-        except TimeoutError:
-            # concurrent.futures.TimeoutError 会在 future.result() 中抛出
-            raise TimeoutError("Code execution exceeded time limit.")
+        except PebbleTimeoutError:
+            # 3. 捕获 pebble 的超时异常
+            logger.error(f"Code execution was terminated by pebble after exceeding {timeout} seconds.")
+            # pebble 已经自动处理了子进程，我们只需向上抛出异常即可
+            raise TimeoutError(f"Code execution exceeded time limit of {timeout}s.")
         except Exception as e:
-            # 捕获子进程中可能出现的其他异常
+            logger.error(f"Worker process or future failed: {type(e).__name__}: {e}")
             raise e
 
 @(on_message(priority=0, block=False).handle())
