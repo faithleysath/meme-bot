@@ -1,6 +1,55 @@
 from datetime import datetime
 from nonebot.adapters.onebot.v11 import MessageEvent, Message, MessageSegment
 from nonebot import on_message, logger
+from curl_cffi import AsyncSession
+
+from collections import OrderedDict
+
+class LRUCache(OrderedDict):
+    def __init__(self, capacity: int):
+        super().__init__()
+        self.capacity = capacity
+
+    def get(self, key, default=None):
+        """获取键值，若不存在返回 None，并将该键标记为最近使用"""
+        if key not in self:
+            return default
+        # 将键移到末尾（最近使用）
+        self.move_to_end(key)
+        return self[key]
+
+    def put(self, key, value):
+        """插入键值对，若容量超限则删除最久未使用的键"""
+        if key in self:
+            # 若键已存在，先移到末尾（更新为最近使用）
+            self.move_to_end(key)
+        # 插入/更新值
+        self[key] = value
+        # 若容量超限，删除最前面的键（最久未使用）
+        if len(self) > self.capacity:
+            self.popitem(last=False)
+
+image_cache: LRUCache[str, bytes] = LRUCache(capacity=128)  # 图片缓存，容量为128
+
+async def fetch_image(filename: str, url: str | None = None) -> bytes | None:
+    """
+    Fetch image from cache or URL.
+    从缓存或 URL 获取图片
+    """
+    # 先从缓存获取
+    cached_image = image_cache.get(filename)
+    if cached_image:
+        return cached_image
+    # 若缓存中不存在且提供了 URL，则从 URL 获取
+    if url:
+        async with AsyncSession() as session:
+            response = await session.get(url)
+            if response.status_code == 200:
+                image_data = response.content
+                # 存入缓存
+                image_cache.put(filename, image_data)
+                return image_data
+    return None
 
 async def segments_to_dicts(segments: MessageSegment | list[MessageSegment] | Message) -> list[dict]:
     """
