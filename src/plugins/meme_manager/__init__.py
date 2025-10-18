@@ -22,7 +22,12 @@ import json
 
 from openai import AsyncClient, NotFoundError, APIStatusError, RateLimitError, APITimeoutError, BadRequestError, APIConnectionError, AuthenticationError, InternalServerError, PermissionDeniedError
 
-conf = get_plugin_config(Config)
+conf = Config()
+
+try:
+    conf = get_plugin_config(Config)
+except Exception as e:
+    logger.warning(f"Failed to get plugin config: {e}")
 
 llm_client = AsyncClient(base_url=conf.meme_llm_base_url, api_key=conf.meme_llm_api_key)
 
@@ -74,6 +79,10 @@ class LRUCache(Generic[KT, VT]):
         self.put(key, value)
 
 image_cache: LRUCache[str, bytes] = LRUCache(capacity=conf.meme_images_cache_capacity)  # 图片缓存，容量为128
+
+def get_image_from_cache(file_name: str) -> tuple[bytes | None, str]:
+    """从缓存获取图片数据和格式"""
+    return image_cache.get(file_name), file_name.split('.')[-1]
 
 class SessionHistory:
     """存储每个会话的消息历史记录"""
@@ -222,21 +231,44 @@ from concurrent.futures import TimeoutError
 import os
 from RestrictedPython import compile_restricted, safe_builtins # 确保在顶层导入
 
-@asynchronous.process
+@asynchronous.process(timeout=5)
 def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_mb: int):
     """
     这个函数将会在子进程中被独立执行。
     它必须是模块的顶层函数，才能被 pickle。
     """
+    import PIL, base64, io
     if os.name == 'posix':
         import resource
         memory_limit_bytes = memory_mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+# --- START OF FIX ---
+        try:
+            # Get the current hard limit
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+
+            # Set the new soft limit to be the smaller of the desired limit or the existing hard limit
+            # If hard limit is -1 (RLIM_INFINITY), any value is fine.
+            if hard != resource.RLIM_INFINITY:
+                new_limit = min(memory_limit_bytes, hard)
+            else:
+                new_limit = memory_limit_bytes
+
+            resource.setrlimit(resource.RLIMIT_AS, (new_limit, hard))
+        except Exception as e:
+            # Log a warning if setting the limit fails for any reason, but don't crash
+            print(f"Warning: Failed to set memory limit: {e}")
+        # --- END OF FIX ---
     
     try:
         byte_code = compile_restricted(code, '<string>', 'exec')
         # __builtins__ 必须在子进程中重新构建，而不是通过参数传递
         safe_globals = {"__builtins__": safe_builtins, **global_vars}
+        safe_globals = { # 这里是给llm额外准备的一些库，请llm编写代码时不要用到import语句，所有库方法都使用句点调用，如PIL.Image这种，否则会被沙盒拒绝执行
+            **safe_globals,
+            "PIL": PIL,
+            "base64": base64,
+            "io": io,
+        }
         exec(byte_code, safe_globals, local_vars)
         return safe_globals, local_vars
     except MemoryError:
@@ -250,15 +282,8 @@ async def worker_with_limits(python_code: str, globals: dict, locals: dict, time
     使用 pebble 内建的 timeout 功能来管理子进程的生命周期，代码更简洁。
     """
     try:
-        result = await _execute_in_process(
-            kwargs={
-                "code": python_code,
-                "global_vars": globals,
-                "local_vars": locals,
-                "memory_mb": memory_limit_mb
-            },
-            timeout=timeout  # <-- 使用这里的 timeout
-            )
+        result = await _execute_in_process(code=python_code, global_vars=globals, local_vars=locals, memory_mb=memory_limit_mb) # type: ignore
+        return result
     except PebbleTimeoutError:
         # 3. 捕获 pebble 的超时异常
         logger.error(f"Code execution was terminated by pebble after exceeding {timeout} seconds.")
@@ -319,6 +344,7 @@ system_prompt = """你是一个强大的人工智能，作为一个QQ机器人�
 4.  如果你认为不需要回复，就不要在代码中为 `message` 变量赋值，或者直接返回一个空的代码块。
 5.  沙箱环境中预先导入了 `Message` 和 `MessageSegment` 类，你可以直接使用它们来构建复杂的回复（例如图文混合）。
 6.  严禁在代码中使用 `import` 语句、文件读写、网络请求或任何有副作用的操作。代码的唯一目标就是创建 `message` 变量。
+7.  再次强调，请勿在代码中使用 `import` 语句，所有需要的库和方法都已经通过变量传递或预导入的方式提供给你，如果你要使用模块内部的方法，请使用句点调用，如 `PIL.Image` 这种形式。
 """
 
 # 用户提示词模板：将所有运行时上下文信息填充进去，形成一个完整的请求
@@ -442,6 +468,7 @@ async def llm_handler(matcher: Matcher, event: MessageEvent):
         safe_globals = {
             "Message": Message,
             "MessageSegment": MessageSegment,
+            "get_image_from_cache": get_image_from_cache,
         }
         safe_locals = {}
         g, l = await worker_with_limits(
@@ -455,6 +482,8 @@ async def llm_handler(matcher: Matcher, event: MessageEvent):
             await finish_and_throttle(matcher, l["message"])
         else:
             await finish_and_throttle(matcher, "代码执行完成，但未生成回复消息。")
+    except FinishedException:
+        raise FinishedException()
     except TimeoutError:
         await finish_and_throttle(matcher, "代码执行超时，未能生成回复。")
     except MemoryError:
