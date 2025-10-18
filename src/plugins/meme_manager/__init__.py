@@ -215,31 +215,54 @@ async def call_llm_with_retry(prompts: list, max_retries: int = 3, delay: float 
         await asyncio.sleep(delay)
     return "LLM request failed after retries."
 
-import os
+import asyncio
 from pebble import ProcessPool
 from concurrent.futures import TimeoutError
+import os
 
 async def worker_with_limits(python_code: str, globals: dict, locals: dict, timeout: int = 5, memory_limit_mb: int = 500):
-    """在子进程中执行受限的 Python 代码，限制时间和内存"""
-    def _(python_code: str, globals: dict, locals: dict, memory_limit_mb: int):
+    """在子进程中执行受限的 Python 代码，并通过 asyncio.to_thread 桥接阻塞操作"""
+    
+    def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_mb: int):
+        """这个函数将会在子进程中执行，它本身是同步阻塞的"""
         from RestrictedPython import compile_restricted, safe_builtins
         if os.name == 'posix':
             import resource
-            # 设置内存限制
-            memory_limit_bytes = memory_limit_mb * 1024 * 1024
+            memory_limit_bytes = memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+        
         try:
-            byte_code = compile_restricted(python_code, '<string>', 'exec')
-            safe_globals = {"__builtins__": safe_builtins, **globals}
-            exec(byte_code, safe_globals, locals)
-            return safe_globals, locals
+            byte_code = compile_restricted(code, '<string>', 'exec')
+            safe_globals = {"__builtins__": safe_builtins, **global_vars}
+            exec(byte_code, safe_globals, local_vars)
+            return safe_globals, local_vars
         except MemoryError:
             raise MemoryError("Code execution exceeded memory limit.")
+
     with ProcessPool(max_workers=1) as pool:
+        # 1. 提交任务到进程池，这是非阻塞的，它会立即返回一个 future 对象
+        future = pool.schedule(
+            _execute_in_process, 
+            kwargs={
+                "code": python_code, 
+                "global_vars": globals, 
+                "local_vars": locals, 
+                "memory_mb": memory_limit_mb
+            }
+        )
+
         try:
-            return await pool.schedule(_,kwargs={"python_code": python_code, "globals": globals, "locals": locals, "memory_limit_mb": memory_limit_mb}, timeout=timeout)
+            # 2. future.result() 是一个阻塞操作。我们使用 asyncio.to_thread 
+            #    把它扔到后台线程执行，这样就不会阻塞主事件循环了。
+            #    我们 await 的是 to_thread 这个异步操作的结果。
+            result = await asyncio.to_thread(future.result, timeout=timeout)
+            return result
         except TimeoutError:
+            # concurrent.futures.TimeoutError 会在 future.result() 中抛出
             raise TimeoutError("Code execution exceeded time limit.")
+        except Exception as e:
+            # 捕获子进程中可能出现的其他异常
+            raise e
 
 @(on_message(priority=0, block=False).handle())
 async def record_message(event: MessageEvent):
