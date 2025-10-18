@@ -312,6 +312,60 @@ def custom_safe_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 import pickle
 
+# ===== 1) 放在文件顶部（custom_safe_import 附近）=====
+
+EXTRA_SAFE_BUILTINS = {
+    # 标准数值/序列操作
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "abs": abs,
+    "round": round,
+    "len": len,
+    "divmod": divmod,
+    "pow": pow,          # 允许 pow(a, b[, mod])
+    
+    # 排序与遍历
+    "sorted": sorted,
+    "range": range,
+    "enumerate": enumerate,
+    "zip": zip,
+    "reversed": reversed,
+    "slice": slice,
+    "map": map,
+    "filter": filter,
+    "any": any,
+    "all": all,
+
+    # 基础类型与构造器
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "str": str,
+    "bytes": bytes,
+    "bytearray": bytearray,
+    "memoryview": memoryview,
+
+    "list": list,
+    "tuple": tuple,
+    "set": set,
+    "frozenset": frozenset,
+    "dict": dict,
+
+    # 类型/字符工具
+    "isinstance": isinstance,
+    "issubclass": issubclass,
+    "chr": chr,
+    "ord": ord,
+
+    # 其他常用
+    "hash": hash,        # 注：对不可哈希对象会抛错，仍是安全的
+    "format": format,
+    "print": print,      # 若不想暴露 print，可去掉；你已有 _print_ → logger.info
+}
+
+
+
 @asynchronous.process(timeout=5)
 def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_mb: int):
     """
@@ -343,7 +397,7 @@ def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_m
         byte_code = compile_restricted(code, '<string>', 'exec')
         # __builtins__ 必须在子进程中重新构建，而不是通过参数传递
         safe_globals = {
-                "__builtins__": {**safe_builtins, "__import__": custom_safe_import},
+                "__builtins__": {**safe_builtins, "__import__": custom_safe_import, **EXTRA_SAFE_BUILTINS},
                 # —— RestrictedPython 运行时钩子（按你源码的名字来）——
                 "_getattr_": safe_builtins["_getattr_"],      # = safer_getattr
                 "_getitem_": default_guarded_getitem,
