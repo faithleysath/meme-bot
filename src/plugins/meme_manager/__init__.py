@@ -1,3 +1,16 @@
+from nonebot.plugin import PluginMetadata
+from .config import Config
+
+__plugin_meta__ = PluginMetadata(
+    name="meme-manager",
+    description="",
+    usage="",
+    config=Config,
+)
+
+with open(__file__, "r", encoding="utf-8") as f:
+    __plugin_meta__.extra["source_code"] = f.read()
+
 from datetime import datetime
 from nonebot.adapters.onebot.v11 import MessageEvent, Message, MessageSegment
 from nonebot import on_message, logger
