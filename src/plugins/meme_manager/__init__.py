@@ -13,9 +13,20 @@ with open(__file__, "r", encoding="utf-8") as f:
 
 from datetime import datetime
 from nonebot.adapters.onebot.v11 import MessageEvent, Message, MessageSegment
-from nonebot import on_message, logger
+from nonebot import on_message, logger, get_plugin_config
+from nonebot.exception import FinishedException
 from curl_cffi import AsyncSession, CurlError
 import asyncio
+
+from openai import AsyncClient, NotFoundError, APIStatusError, RateLimitError, APITimeoutError, BadRequestError, APIConnectionError, AuthenticationError, InternalServerError, PermissionDeniedError
+
+conf = get_plugin_config(Config)
+
+llm_client = AsyncClient(base_url=conf.meme_llm_base_url, api_key=conf.meme_llm_api_key)
+
+import nonebot.adapters.onebot.v11.message as ob11_message  # noqa: F401  # for docstring
+with open(ob11_message.__file__, "r", encoding="utf-8") as f:
+    message_doc = f.read() # 准备给llm看的代码
 
 from collections import OrderedDict, deque
 from typing import Generic, TypeVar
@@ -60,7 +71,7 @@ class LRUCache(Generic[KT, VT]):
     def __setitem__(self, key: KT, value: VT):
         self.put(key, value)
 
-image_cache: LRUCache[str, bytes] = LRUCache(capacity=128)  # 图片缓存，容量为128
+image_cache: LRUCache[str, bytes] = LRUCache(capacity=conf.meme_images_cache_capacity)  # 图片缓存，容量为128
 
 class SessionHistory:
     """存储每个会话的消息历史记录"""
@@ -95,7 +106,7 @@ class SessionHistory:
     def __len__(self) -> int:
         return len(self._history)
 
-session_history = SessionHistory(max_history=20)  # 会话历史记录，最多存储20条消息
+session_history = SessionHistory(max_history=conf.meme_max_history_messages)  # 会话历史记录，最多存储20条消息
 
 async def fetch_image(filename: str, url: str | None = None) -> bytes | None:
     """
@@ -177,6 +188,55 @@ async def serialize_message_event_with_images(event: MessageEvent) -> tuple[dict
         image_names.update(reply_image_names)
 
     return result, image_names
+
+async def call_llm_with_retry(prompts: list, max_retries: int = 3, delay: float = 1.0):
+    """调用 LLM 接口，失败时重试"""
+    for attempt in range(max_retries):
+        try:
+            response = await llm_client.chat.completions.create(
+                model=conf.meme_llm_model,
+                messages=prompts,
+                temperature=conf.meme_llm_temperature,
+                top_p=conf.meme_llm_top_p,
+                timeout=conf.meme_llm_timeout,
+            )
+            return response.choices[0].message.content
+        except FinishedException:
+            raise FinishedException()
+        except RateLimitError:
+            logger.warning(f"LLM rate limit exceeded, attempt {attempt + 1}/{max_retries}")
+        except (APIConnectionError, APITimeoutError):
+            logger.warning(f"LLM connection or timeout error, attempt {attempt + 1}/{max_retries}")
+        except (NotFoundError, BadRequestError, AuthenticationError, PermissionDeniedError, InternalServerError, APIStatusError) as e:
+            logger.error(f"LLM API error: {e}")
+            return e
+        await asyncio.sleep(delay)
+    return "LLM request failed after retries."
+
+import os
+from pebble import ProcessPool
+from concurrent.futures import TimeoutError
+
+async def worker_with_limits(python_code: str, globals: dict, locals: dict, timeout: int = 5, memory_limit_mb: int = 100):
+    """在子进程中执行受限的 Python 代码，限制时间和内存"""
+    def _(python_code: str, globals: dict, locals: dict, memory_limit_mb: int):
+        from RestrictedPython import compile_restricted
+        if os.name == 'posix':
+            import resource
+            # 设置内存限制
+            memory_limit_bytes = memory_limit_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+        try:
+            byte_code = compile_restricted(python_code, '<string>', 'exec')
+            exec(byte_code, globals, locals)
+            return locals.get("result", None)
+        except MemoryError:
+            raise MemoryError("Code execution exceeded memory limit.")
+    with ProcessPool(max_workers=1) as pool:
+        try:
+            return await pool.schedule(_,kwargs={"python_code": python_code, "globals": globals, "locals": locals, "memory_limit_mb": memory_limit_mb}, timeout=timeout)
+        except TimeoutError:
+            raise TimeoutError("Code execution exceeded time limit.")
 
 @(on_message(priority=0, block=False).handle())
 async def record_message(event: MessageEvent):
