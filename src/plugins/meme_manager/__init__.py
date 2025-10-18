@@ -216,13 +216,13 @@ async def call_llm_with_retry(prompts: list, max_retries: int = 3, delay: float 
     return "LLM request failed after retries."
 
 import asyncio
-from pebble import ProcessPool
+from pebble import asynchronous
 from concurrent.futures import TimeoutError as PebbleTimeoutError
 from concurrent.futures import TimeoutError
 import os
 from RestrictedPython import compile_restricted, safe_builtins # 确保在顶层导入
 
-# 1. 将这个函数从 worker_with_limits 内部移动到模块顶层
+@asynchronous.process
 def _execute_in_process(code: str, global_vars: dict, local_vars: dict, memory_mb: int):
     """
     这个函数将会在子进程中被独立执行。
@@ -249,10 +249,8 @@ async def worker_with_limits(python_code: str, globals: dict, locals: dict, time
     """
     使用 pebble 内建的 timeout 功能来管理子进程的生命周期，代码更简洁。
     """
-    with ProcessPool(max_workers=1) as pool:
-        # 1. 在调度任务时，直接传入 timeout 参数
-        future = pool.schedule(
-            _execute_in_process,
+    try:
+        result = await _execute_in_process(
             kwargs={
                 "code": python_code,
                 "global_vars": globals,
@@ -260,21 +258,15 @@ async def worker_with_limits(python_code: str, globals: dict, locals: dict, time
                 "memory_mb": memory_limit_mb
             },
             timeout=timeout  # <-- 使用这里的 timeout
-        )
-
-        try:
-            # 2. 像之前一样，在后台线程中等待结果。
-            #    如果 pebble 检测到超时，future.result() 会立即抛出 PebbleTimeoutError。
-            result = await asyncio.to_thread(future.result) # <-- 这里不再需要 timeout
-            return result
-        except PebbleTimeoutError:
-            # 3. 捕获 pebble 的超时异常
-            logger.error(f"Code execution was terminated by pebble after exceeding {timeout} seconds.")
-            # pebble 已经自动处理了子进程，我们只需向上抛出异常即可
-            raise TimeoutError(f"Code execution exceeded time limit of {timeout}s.")
-        except Exception as e:
-            logger.error(f"Worker process or future failed: {type(e).__name__}: {e}")
-            raise e
+            )
+    except PebbleTimeoutError:
+        # 3. 捕获 pebble 的超时异常
+        logger.error(f"Code execution was terminated by pebble after exceeding {timeout} seconds.")
+        # pebble 已经自动处理了子进程，我们只需向上抛出异常即可
+        raise TimeoutError(f"Code execution exceeded time limit of {timeout}s.")
+    except Exception as e:
+        logger.error(f"Worker process or future failed: {type(e).__name__}: {e}")
+        raise e
 
 @(on_message(priority=0, block=False).handle())
 async def record_message(event: MessageEvent):
