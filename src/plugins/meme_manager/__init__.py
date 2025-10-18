@@ -312,7 +312,7 @@ def get_user_prompt(plugin_source: str, message_source: str, history: list[dict]
 
 ```python
 {plugin_source}
-````
+```
 
 ### 2. 参考资料：`Message` 类源码
 
