@@ -13,3 +13,5 @@ class Config(BaseModel):
     meme_llm_timeout: int = 15 # LLM模型请求的超时时间，单位为秒
     meme_max_history_messages: int = 20 # 用于生成上下文的最大历史消息数量
     meme_images_cache_capacity: int = 128 # 图片缓存的最大容量
+    meme_sandbox_code_timeout: int = 5 # 沙箱代码执行的超时时间，单位为秒
+    meme_sandbox_code_memory_limit_mb: int = 500 # 沙箱代码执行的内存限制，单位为MB

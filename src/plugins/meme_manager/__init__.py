@@ -12,8 +12,9 @@ with open(__file__, "r", encoding="utf-8") as f:
     __plugin_meta__.extra["source_code"] = f.read()
 
 from datetime import datetime
-from nonebot.adapters.onebot.v11 import MessageEvent, Message, MessageSegment
+from nonebot.adapters.onebot.v11 import MessageEvent, Message, MessageSegment, Bot, PrivateMessageEvent
 from nonebot import on_message, logger, get_plugin_config
+from nonebot.matcher import Matcher
 from nonebot.exception import FinishedException
 from curl_cffi import AsyncSession, CurlError
 import asyncio
@@ -217,10 +218,10 @@ import os
 from pebble import ProcessPool
 from concurrent.futures import TimeoutError
 
-async def worker_with_limits(python_code: str, globals: dict, locals: dict, timeout: int = 5, memory_limit_mb: int = 100):
+async def worker_with_limits(python_code: str, globals: dict, locals: dict, timeout: int = 5, memory_limit_mb: int = 500):
     """在子进程中执行受限的 Python 代码，限制时间和内存"""
     def _(python_code: str, globals: dict, locals: dict, memory_limit_mb: int):
-        from RestrictedPython import compile_restricted
+        from RestrictedPython import compile_restricted, safe_builtins
         if os.name == 'posix':
             import resource
             # 设置内存限制
@@ -228,8 +229,9 @@ async def worker_with_limits(python_code: str, globals: dict, locals: dict, time
             resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
         try:
             byte_code = compile_restricted(python_code, '<string>', 'exec')
-            exec(byte_code, globals, locals)
-            return locals.get("result", None)
+            safe_globals = {"__builtins__": safe_builtins, **globals}
+            exec(byte_code, safe_globals, locals)
+            return safe_globals, locals
         except MemoryError:
             raise MemoryError("Code execution exceeded memory limit.")
     with ProcessPool(max_workers=1) as pool:
@@ -242,3 +244,38 @@ async def worker_with_limits(python_code: str, globals: dict, locals: dict, time
 async def record_message(event: MessageEvent):
     """记录每条消息到会话历史中"""
     session_history.add_event(event.target_id, event)
+
+from nonebot.permission import Permission
+from nonebot.rule import Rule
+
+def rule_wrapper(func):
+    return Rule(func)
+
+def permission_wrapper(func):
+    return Permission(func)
+
+self_sent_time: float = 0 # 记录最后一次自身消息的时间戳
+
+async def finish_and_throttle(matcher: Matcher, message: str | Message):
+    global self_sent_time
+    self_sent_time = datetime.now().timestamp()
+    await matcher.finish(message) # 会抛出 FinishedException
+
+@permission_wrapper
+async def is_target_user(bot: Bot, event: MessageEvent) -> bool:
+    """检查是否为目标用户并节流"""
+    if conf.meme_listen_user_id is None:
+        conf.meme_listen_user_id = int(bot.self_id)
+    return (event.user_id == conf.meme_listen_user_id) and (datetime.now().timestamp() - self_sent_time > conf.meme_self_sent_timeout) # 防止bot响应的消息被当成请求，默认为2秒
+
+@rule_wrapper
+async def to_me(bot: Bot, event: PrivateMessageEvent) -> bool:
+    """检查是否为私聊消息"""
+    return event.target_id == int(bot.self_id)
+
+@(on_message(priority=1, permission=is_target_user, rule=to_me, block=True).handle())
+async def llm_handler(matcher: Matcher, event: MessageEvent):
+    """
+    处理来自目标用户的消息，调用 LLM 生成回复
+    《告LLM书》
+    """
