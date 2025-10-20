@@ -22,7 +22,6 @@ import subprocess
 import sys
 from concurrent.futures import TimeoutError as PebbleTimeoutError, TimeoutError
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
 
 # ============================================================================
 # 第三方库导入
