@@ -1,60 +1,125 @@
-# === 标准库导入 ===
+"""
+安全沙盒执行环境
+
+提供受限的 Python 代码执行环境，支持：
+- 安全的模块导入控制
+- 受限的内置函数访问
+- 进程隔离执行
+- 依赖包管理
+- 超时和资源限制
+"""
+
+# ============================================================================
+# 标准库导入
+# ============================================================================
+
+import importlib
+import os
 import pickle
 import re
-import importlib
-from pathlib import Path
+import shutil
+import subprocess
+import sys
 from concurrent.futures import TimeoutError as PebbleTimeoutError, TimeoutError
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
-# === 第三方库导入 ===
+# ============================================================================
+# 第三方库导入
+# ============================================================================
+
 from nonebot import logger, require
 from pebble import asynchronous
 from RestrictedPython import safe_builtins, compile_restricted
 from RestrictedPython.Eval import default_guarded_getiter, default_guarded_getitem
-from RestrictedPython.PrintCollector import PrintCollector
 from RestrictedPython.Guards import (
     full_write_guard,
-    guarded_unpack_sequence,
     guarded_iter_unpack_sequence,
+    guarded_unpack_sequence,
 )
+from RestrictedPython.PrintCollector import PrintCollector
+
+# ============================================================================
+# 插件依赖导入
+# ============================================================================
+
+require("nonebot_plugin_localstore")
+import nonebot_plugin_localstore as store
 
 # ============================================================================
 # 配置常量
 # ============================================================================
 
-# === 沙盒安全配置 ===
-# 允许导入的模块前缀白名单（包括所有子模块）
+# 沙盒安全配置
 BUILTIN_MODULE_PREFIXES = {
-    "math",      # 数学函数
-    "io",        # 输入输出操作
-    "base64",    # Base64 编解码
-    "PIL",       # Python Imaging Library 及其子模块
+    "math",    # 数学函数库
+    "io",      # 输入输出操作
+    "base64",  # Base64 编解码
+    "PIL",     # Python Imaging Library 及其子模块
 }
 
-# === 正则表达式模式 ===
-# 模块名称验证模式
-_MODULE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-# 标识符验证模式
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# 正则表达式模式
+MODULE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# === 性能优化配置 ===
-# 导入模块缓存，减少重复导入开销
+# 性能优化配置
 _import_cache: dict[str, object] = {}
 
-# === 执行配置 ===
-# 默认代码执行超时时间（秒）
-DEFAULT_TIMEOUT = 5
+# 执行配置
+DEFAULT_TIMEOUT = 5  # 默认代码执行超时时间（秒）
 
 # ============================================================================
-# 工具函数
+# 安全模块导入
 # ============================================================================
 
-def _is_allowed(name: str) -> bool:
-    """检查模块名称是否在允许的前缀白名单中"""
-    return any(name == p or name.startswith(p + ".") for p in list(BUILTIN_MODULE_PREFIXES)+dependencyManager.get_dependency_list())
+def _is_module_allowed(module_name: str) -> bool:
+    """
+    检查模块名称是否在允许的前缀白名单中
+
+    Args:
+        module_name: 要检查的模块名称
+
+    Returns:
+        bool: 是否允许导入该模块
+    """
+    allowed_prefixes = list(BUILTIN_MODULE_PREFIXES) + dependencyManager.get_dependency_list()
+    return any(
+        module_name == prefix or module_name.startswith(prefix + ".")
+        for prefix in allowed_prefixes
+    )
+
+
+def _validate_module_name(name: str) -> bool:
+    """
+    验证模块名称格式是否合法
+
+    Args:
+        name: 模块名称
+
+    Returns:
+        bool: 模块名称是否合法
+    """
+    return isinstance(name, str) and bool(MODULE_NAME_PATTERN.match(name))
+
+
+def _validate_identifier(identifier: str) -> bool:
+    """
+    验证标识符格式是否合法
+
+    Args:
+        identifier: 标识符名称
+
+    Returns:
+        bool: 标识符是否合法
+    """
+    return isinstance(identifier, str) and bool(IDENTIFIER_PATTERN.match(identifier))
+
 
 def custom_safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     """
     安全的模块导入函数，仅允许白名单中的模块
+
+    此函数作为 RestrictedPython 的自定义 __import__ 实现，提供严格的模块导入控制。
 
     Args:
         name: 要导入的模块名称
@@ -67,61 +132,62 @@ def custom_safe_import(name, globals=None, locals=None, fromlist=(), level=0):
         导入的模块对象
 
     Raises:
-        ImportError: 当导入不被允许时抛出
+        ImportError: 当导入不被允许或格式错误时抛出
     """
     # 禁止相对导入
-    if level and level != 0:
-        raise ImportError("SECURITY ERROR: Relative import is not allowed.")
+    if level != 0:
+        raise ImportError("SECURITY ERROR: 相对导入被禁止")
 
-    # 基本校验
-    if not isinstance(name, str) or not _MODULE_NAME_RE.match(name):
-        raise ImportError(f"SECURITY ERROR: Invalid module name '{name}'.")
+    # 验证模块名称格式
+    if not _validate_module_name(name):
+        raise ImportError(f"SECURITY ERROR: 无效的模块名称 '{name}'")
 
-    # 检查白名单
-    if not _is_allowed(name):
-        raise ImportError(f"SECURITY ERROR: Importing '{name}' is not allowed.")
+    # 检查模块是否在白名单中
+    if not _is_module_allowed(name):
+        raise ImportError(f"SECURITY ERROR: 不允许导入模块 '{name}'")
 
-    # 导入模块（带缓存优化）
+    # 从缓存导入或执行导入
     if name in _import_cache:
-        mod = _import_cache[name]
+        module = _import_cache[name]
     else:
-        mod = importlib.import_module(name)
-        _import_cache[name] = mod
+        module = importlib.import_module(name)
+        _import_cache[name] = module
 
-    # 处理 fromlist：from X import Y, Z
+    # 处理 from X import Y, Z 语法
     if fromlist:
         for item in fromlist:
-            if not isinstance(item, str) or not _IDENT_RE.match(item):
-                raise ImportError(f"SECURITY ERROR: Invalid fromlist item '{item}'.")
+            if not _validate_identifier(item):
+                raise ImportError(f"SECURITY ERROR: 无效的导入项 '{item}'")
 
-            # 先尝试获取模块的顶层属性
+            # 首先尝试获取模块属性
             try:
-                setattr(mod, item, getattr(mod, item))
+                setattr(module, item, getattr(module, item))
                 continue
-            except Exception:
+            except AttributeError:
                 pass
 
-            # 当作子模块导入
-            subname = f"{name}.{item}"
-            if not _is_allowed(subname):
-                raise ImportError(f"SECURITY ERROR: Importing '{subname}' is not allowed.")
+            # 尝试作为子模块导入
+            submodule_name = f"{name}.{item}"
+            if not _is_module_allowed(submodule_name):
+                raise ImportError(f"SECURITY ERROR: 不允许导入子模块 '{submodule_name}'")
 
-            if subname in _import_cache:
-                submod = _import_cache[subname]
+            # 导入子模块
+            if submodule_name in _import_cache:
+                submodule = _import_cache[submodule_name]
             else:
-                submod = importlib.import_module(subname)
-                _import_cache[subname] = submod
+                submodule = importlib.import_module(submodule_name)
+                _import_cache[submodule_name] = submodule
 
-            setattr(mod, item, submod)
+            setattr(module, item, submodule)
 
-    return mod
+    return module
 
 # ============================================================================
 # 安全内置函数配置
 # ============================================================================
 
-EXTRA_SAFE_BUILTINS = {
-    # === 数值与数学操作 ===
+# 数值与数学操作
+_NUMERIC_BUILTINS = {
     "min": min,
     "max": max,
     "sum": sum,
@@ -129,9 +195,11 @@ EXTRA_SAFE_BUILTINS = {
     "round": round,
     "len": len,
     "divmod": divmod,
-    "pow": pow,          # 支持 pow(a, b[, mod]) 形式
+    "pow": pow,
+}
 
-    # === 序列与迭代操作 ===
+# 序列与迭代操作
+_SEQUENCE_BUILTINS = {
     "sorted": sorted,
     "range": range,
     "enumerate": enumerate,
@@ -142,8 +210,10 @@ EXTRA_SAFE_BUILTINS = {
     "filter": filter,
     "any": any,
     "all": all,
+}
 
-    # === 基础类型构造器 ===
+# 基础类型构造器
+_TYPE_BUILTINS = {
     "int": int,
     "float": float,
     "bool": bool,
@@ -151,120 +221,241 @@ EXTRA_SAFE_BUILTINS = {
     "bytes": bytes,
     "bytearray": bytearray,
     "memoryview": memoryview,
+}
 
-    # === 容器类型 ===
+# 容器类型
+_CONTAINER_BUILTINS = {
     "list": list,
     "tuple": tuple,
     "set": set,
     "frozenset": frozenset,
     "dict": dict,
+}
 
-    # === 类型检查与转换 ===
+# 类型检查与转换
+_TYPE_CHECK_BUILTINS = {
     "isinstance": isinstance,
     "issubclass": issubclass,
     "chr": chr,
     "ord": ord,
+}
 
-    # === 其他工具函数 ===
+# 其他工具函数
+_UTILITY_BUILTINS = {
     "hash": hash,        # 对不可哈希对象会抛出异常，仍是安全的
     "format": format,
+}
+
+# 合并所有安全的内置函数
+EXTRA_SAFE_BUILTINS = {
+    **_NUMERIC_BUILTINS,
+    **_SEQUENCE_BUILTINS,
+    **_TYPE_BUILTINS,
+    **_CONTAINER_BUILTINS,
+    **_TYPE_CHECK_BUILTINS,
+    **_UTILITY_BUILTINS,
 }
 
 # ============================================================================
 # 依赖管理器
 # ============================================================================
 
-require("nonebot_plugin_localstore")
-
-import nonebot_plugin_localstore as store
-
 class DependencyManager:
-    """依赖管理器，用于沙盒环境的依赖包管理"""
+    """
+    沙盒环境依赖管理器
+
+    负责管理沙盒执行环境的 Python 依赖包，包括：
+    - 虚拟环境创建和管理
+    - 依赖包安装和卸载
+    - 动态模块导入
+    - 环境清理和重建
+    """
+
     def __init__(self):
-        self.requirements_txt_file: Path = store.get_plugin_data_file("sandbox_requirements.txt")
+        """初始化依赖管理器"""
+        self.requirements_file: Path = store.get_plugin_data_file("sandbox_requirements.txt")
         self.venv_path: Path = store.get_plugin_cache_dir() / "sandbox_venv"
 
-    def ensure_dependencies(self):
-        """确保沙盒环境的依赖包已安装"""
-        if not self.requirements_txt_file.exists():
-            return  # 没有依赖文件，无需安装
+    def _get_pip_executable(self) -> Path:
+        """获取 pip 可执行文件路径"""
+        if os.name == "nt":  # Windows
+            return self.venv_path / "Scripts" / "pip.exe"
+        else:  # Linux/macOS
+            return self.venv_path / "bin" / "pip"
 
-        import subprocess
-        import venv
+    def _get_site_packages_path(self) -> str:
+        """获取虚拟环境的 site-packages 路径"""
+        if os.name == "nt":  # Windows
+            return os.path.join(
+                self.venv_path,
+                "Lib",
+                "site-packages"
+            )
+        else:  # Linux/macOS
+            return os.path.join(
+                self.venv_path,
+                "lib",
+                f"python{sys.version_info.major}.{sys.version_info.minor}",
+                "site-packages"
+            )
+
+    def ensure_dependencies(self) -> None:
+        """
+        确保沙盒环境的依赖包已安装
+
+        如果 requirements.txt 文件存在，会自动创建虚拟环境并安装所有依赖包。
+        """
+        if not self.requirements_file.exists():
+            logger.debug("未找到依赖文件，跳过依赖安装")
+            return
 
         # 创建虚拟环境（如果不存在）
         if not self.venv_path.exists():
+            logger.info(f"创建沙盒虚拟环境: {self.venv_path}")
+            import venv
             venv.create(self.venv_path, with_pip=True)
 
         # 安装依赖包
-        pip_executable = self.venv_path / "bin" / "pip"
-        subprocess.check_call([
-            str(pip_executable),
-            "install",
-            "-r",
-            str(self.requirements_txt_file)
-        ])
+        try:
+            pip_executable = self._get_pip_executable()
+            logger.info(f"安装沙盒依赖包: {self.requirements_file}")
+
+            subprocess.check_call([
+                str(pip_executable),
+                "install",
+                "-r",
+                str(self.requirements_file)
+            ])
+            logger.info("依赖包安装完成")
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"依赖包安装失败: {e}")
+            raise
 
     def get_dependency_list(self) -> list[str]:
-        """获取当前依赖包列表"""
-        if not self.requirements_txt_file.exists():
+        """
+        获取当前依赖包列表
+
+        Returns:
+            依赖包名称列表
+        """
+        if not self.requirements_file.exists():
             return []
-        with self.requirements_txt_file.open("r") as f:
-            return [line.strip() for line in f if line.strip()]
-        
-    def save_dependency_list(self, dependencies: list[str]):
-        """保存依赖包列表到 requirements.txt"""
-        with self.requirements_txt_file.open("w") as f:
-            for dep in dependencies:
-                f.write(f"{dep}\n")
-    
-    def add_dependency(self, dependency: str):
-        """添加单个依赖包并安装"""
+
+        try:
+            with self.requirements_file.open("r", encoding="utf-8") as f:
+                return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        except Exception as e:
+            logger.error(f"读取依赖文件失败: {e}")
+            return []
+
+    def save_dependency_list(self, dependencies: list[str]) -> None:
+        """
+        保存依赖包列表到 requirements.txt
+
+        Args:
+            dependencies: 依赖包名称列表
+        """
+        try:
+            with self.requirements_file.open("w", encoding="utf-8") as f:
+                f.write("# 沙盒环境依赖包\n")
+                for dep in dependencies:
+                    f.write(f"{dep}\n")
+            logger.debug(f"已保存 {len(dependencies)} 个依赖包")
+        except Exception as e:
+            logger.error(f"保存依赖文件失败: {e}")
+            raise
+
+    def add_dependency(self, dependency: str) -> None:
+        """
+        添加单个依赖包并安装
+
+        Args:
+            dependency: 要添加的依赖包名称
+        """
         dependencies = self.get_dependency_list()
         if dependency not in dependencies:
             dependencies.append(dependency)
             self.save_dependency_list(dependencies)
             self.ensure_dependencies()
+            logger.info(f"已添加依赖包: {dependency}")
+        else:
+            logger.debug(f"依赖包已存在: {dependency}")
 
-    def remove_dependency(self, dependency: str):
-        """移除单个依赖包并更新安装"""
+    def remove_dependency(self, dependency: str) -> None:
+        """
+        移除单个依赖包并更新安装
+
+        Args:
+            dependency: 要移除的依赖包名称
+        """
         dependencies = self.get_dependency_list()
         if dependency in dependencies:
             dependencies.remove(dependency)
             self.save_dependency_list(dependencies)
             self.ensure_dependencies()
+            logger.info(f"已移除依赖包: {dependency}")
+        else:
+            logger.debug(f"依赖包不存在: {dependency}")
 
-    def rebuild_environment(self):
-        """重新构建沙盒环境，重新安装所有依赖包"""
+    def rebuild_environment(self) -> None:
+        """
+        重新构建沙盒环境，重新安装所有依赖包
+
+        此操作会删除现有虚拟环境并重新创建。
+        """
+        logger.info("开始重新构建沙盒环境")
+
         if self.venv_path.exists():
-            import shutil
+            logger.debug("删除现有虚拟环境")
             shutil.rmtree(self.venv_path)
+
         self.ensure_dependencies()
+        logger.info("沙盒环境重建完成")
 
-    def clear_environment(self):
-        """清理沙盒环境，删除虚拟环境和依赖文件"""
-        if self.venv_path.exists():
-            import shutil
-            shutil.rmtree(self.venv_path)
-        if self.requirements_txt_file.exists():
-            self.requirements_txt_file.unlink()
+    def clear_environment(self) -> None:
+        """
+        完全清理沙盒环境，删除虚拟环境和依赖文件
+        """
+        logger.info("开始清理沙盒环境")
+
+        try:
+            if self.venv_path.exists():
+                shutil.rmtree(self.venv_path)
+                logger.debug("已删除虚拟环境")
+
+            if self.requirements_file.exists():
+                self.requirements_file.unlink()
+                logger.debug("已删除依赖文件")
+
+            logger.info("沙盒环境清理完成")
+
+        except Exception as e:
+            logger.error(f"清理环境失败: {e}")
+            raise
 
     def import_package(self, package_name: str):
-        """从沙盒环境中导入指定包"""
-        import os, sys
-        # 虚拟环境的 site-packages 路径（Windows 和 Linux/macOS 路径格式不同）
-        venv_site_packages = os.path.join(
-            self.venv_path,
-            "Lib", "site-packages" if os.name == "nt" else "lib",
-            f"python{sys.version_info.major}.{sys.version_info.minor}",
-            "site-packages"
-        )
-        sys.path.insert(0, venv_site_packages)
+        """
+        从沙盒环境中导入指定包
+
+        Args:
+            package_name: 要导入的包名称
+
+        Returns:
+            导入的模块对象
+        """
+        site_packages_path = self._get_site_packages_path()
+
+        # 临时添加虚拟环境路径到 sys.path
+        sys.path.insert(0, site_packages_path)
         try:
+            logger.debug(f"从沙盒环境导入包: {package_name}")
             return importlib.import_module(package_name)
         finally:
             sys.path.pop(0)
 
+
+# 全局依赖管理器实例
 dependencyManager = DependencyManager()
 
 
@@ -282,8 +473,8 @@ def _execute_in_process(code: str, global_vars: dict, local_vars: dict):
 
     Args:
         code: 要执行的 Python 代码字符串
-        global_vars: 传入的全局变量字典
-        local_vars: 传入的局部变量字典
+        global_vars: 传入代码的全局变量字典
+        local_vars: 传入代码的局部变量字典
 
     Returns:
         tuple: (filtered_globals, filtered_locals) - 经过序列化过滤的变量字典
@@ -293,27 +484,37 @@ def _execute_in_process(code: str, global_vars: dict, local_vars: dict):
         Exception: 其他执行异常
     """
     try:
-        # 编译受限制的代码
+        logger.debug("开始编译受限制代码")
         byte_code = compile_restricted(code, '<string>', 'exec')
 
-        # 构建安全的全局变量环境
+        logger.debug("构建安全的全局变量环境")
         safe_globals = _build_safe_globals(global_vars)
 
-        # 执行代码
+        logger.debug("执行代码")
         exec(byte_code, safe_globals, local_vars)
 
-        # 过滤并返回可序列化的结果
+        logger.debug("过滤可序列化对象")
         return _filter_serializable_objects(safe_globals, local_vars)
 
     except MemoryError:
-        raise MemoryError("Code execution exceeded memory limit.")
+        logger.error("代码执行超出内存限制")
+        raise MemoryError("代码执行超出内存限制")
     except Exception as e:
+        logger.error(f"子进程执行失败: {type(e).__name__}: {e}")
         # 将子进程中的异常传播到主进程
         raise e
 
 
 def _build_safe_globals(global_vars: dict) -> dict:
-    """构建安全的全局变量环境"""
+    """
+    构建安全的全局变量环境
+
+    Args:
+        global_vars: 用户提供的全局变量字典
+
+    Returns:
+        包含安全内置函数和 RestrictedPython 钩子的全局变量字典
+    """
     return {
         "__builtins__": {
             **safe_builtins,
@@ -332,17 +533,45 @@ def _build_safe_globals(global_vars: dict) -> dict:
     }
 
 
-def _filter_serializable_objects(safe_globals: dict, local_vars: dict) -> tuple:
-    """过滤出可序列化的对象，确保能在进程间传递"""
-    def is_picklable(obj):
-        try:
-            pickle.dumps(obj)
-            return True
-        except Exception:
-            return False
+def _is_serializable(obj) -> bool:
+    """
+    检查对象是否可序列化
 
-    filtered_globals = {k: v for k, v in safe_globals.items() if is_picklable(v)}
-    filtered_locals = {k: v for k, v in local_vars.items() if is_picklable(v)}
+    Args:
+        obj: 要检查的对象
+
+    Returns:
+        bool: 对象是否可序列化
+    """
+    try:
+        pickle.dumps(obj)
+        return True
+    except Exception:
+        return False
+
+
+def _filter_serializable_objects(safe_globals: dict, local_vars: dict) -> tuple:
+    """
+    过滤出可序列化的对象，确保能在进程间传递
+
+    Args:
+        safe_globals: 安全的全局变量字典
+        local_vars: 局部变量字典
+
+    Returns:
+        tuple: (filtered_globals, filtered_locals) - 过滤后的变量字典
+    """
+    filtered_globals = {
+        key: value for key, value in safe_globals.items()
+        if _is_serializable(value)
+    }
+    filtered_locals = {
+        key: value for key, value in local_vars.items()
+        if _is_serializable(value)
+    }
+
+    logger.debug(f"过滤后的全局变量: {len(filtered_globals)} 个")
+    logger.debug(f"过滤后的局部变量: {len(filtered_locals)} 个")
 
     return filtered_globals, filtered_locals
 
@@ -350,11 +579,17 @@ def _filter_serializable_objects(safe_globals: dict, local_vars: dict) -> tuple:
 # 主要接口函数
 # ============================================================================
 
-async def worker_with_limits(python_code: str, globals: dict, locals: dict, timeout: int = DEFAULT_TIMEOUT):
+async def worker_with_limits(
+    python_code: str,
+    globals: dict,
+    locals: dict,
+    timeout: int = DEFAULT_TIMEOUT
+) -> tuple:
     """
     带限制的异步代码执行工作器
 
-    使用 pebble 库的内置超时功能管理子进程生命周期，提供安全可靠的代码执行环境。
+    这是沙盒模块的主要接口函数，提供安全、受限的 Python 代码执行环境。
+    使用进程隔离和超时控制确保主程序的安全性。
 
     Args:
         python_code: 要执行的 Python 代码字符串
@@ -368,20 +603,60 @@ async def worker_with_limits(python_code: str, globals: dict, locals: dict, time
     Raises:
         TimeoutError: 当代码执行超过指定时间限制时
         Exception: 其他执行相关异常
+
+    Example:
+        >>> code = "result = 2 + 2"
+        >>> globals = {}
+        >>> locals = {}
+        >>> exec_globals, exec_locals = await worker_with_limits(code, globals, locals)
+        >>> print(exec_locals["result"])  # 输出: 4
     """
+    if not isinstance(python_code, str):
+        raise TypeError("python_code 必须是字符串")
+
+    if not isinstance(globals, dict):
+        raise TypeError("globals 必须是字典")
+
+    if not isinstance(locals, dict):
+        raise TypeError("locals 必须是字典")
+
+    if not isinstance(timeout, int) or timeout <= 0:
+        raise ValueError("timeout 必须是正整数")
+
+    logger.info(f"开始执行沙盒代码，超时限制: {timeout} 秒")
+    logger.debug(f"代码长度: {len(python_code)} 字符")
+
     try:
         result = await _execute_in_process(  # type: ignore
             code=python_code,
             global_vars=globals,
             local_vars=locals
         )
+
+        logger.info("沙盒代码执行成功")
         return result
 
     except PebbleTimeoutError:
         # 捕获 pebble 的超时异常并转换为标准 TimeoutError
-        logger.error(f"Code execution terminated after exceeding {timeout} seconds")
-        raise TimeoutError(f"Code execution exceeded time limit of {timeout}s")
+        error_msg = f"代码执行超时，超过 {timeout} 秒限制"
+        logger.error(error_msg)
+        raise TimeoutError(error_msg)
 
     except Exception as e:
-        logger.error(f"Worker process execution failed: {type(e).__name__}: {e}")
+        error_msg = f"工作进程执行失败: {type(e).__name__}: {e}"
+        logger.error(error_msg)
         raise e
+
+
+# ============================================================================
+# 公共 API 导出
+# ============================================================================
+
+__all__ = [
+    "worker_with_limits",
+    "DependencyManager",
+    "dependencyManager",
+    "custom_safe_import",
+    "DEFAULT_TIMEOUT",
+    "BUILTIN_MODULE_PREFIXES",
+]
