@@ -254,7 +254,7 @@ class DependencyManager:
         import os, sys
         # 虚拟环境的 site-packages 路径（Windows 和 Linux/macOS 路径格式不同）
         venv_site_packages = os.path.join(
-            os.path.abspath("./venv"),
+            self.venv_path,
             "Lib", "site-packages" if os.name == "nt" else "lib",
             f"python{sys.version_info.major}.{sys.version_info.minor}",
             "site-packages"
