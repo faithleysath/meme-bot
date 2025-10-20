@@ -50,7 +50,7 @@ DEFAULT_TIMEOUT = 5
 
 def _is_allowed(name: str) -> bool:
     """检查模块名称是否在允许的前缀白名单中"""
-    return any(name == p or name.startswith(p + ".") for p in ALLOWED_PREFIXES)
+    return any(name == p or name.startswith(p + ".") for p in list(BUILTIN_MODULE_PREFIXES)+dependencyManager.get_dependency_list())
 
 def custom_safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     """
