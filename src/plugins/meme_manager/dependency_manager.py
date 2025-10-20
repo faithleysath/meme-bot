@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+import venv
 
 import nonebot_plugin_localstore as store
 from nonebot import logger
@@ -30,48 +31,33 @@ class DependencyManager:
     - 将虚拟环境路径添加到 sys.path，使沙盒代码可以导入其中的包。
     """
 
-    # 类级别的路径配置
     _requirements_file: Path = store.get_plugin_data_file("sandbox_requirements.txt")
     _venv_path: Path = store.get_plugin_cache_dir() / "sandbox_venv"
 
     @classmethod
     def _get_pip_executable(cls) -> Path:
-        """获取虚拟环境中 pip 的可执行文件路径"""
-        if os.name == "nt":  # Windows
+        if os.name == "nt":
             return cls._venv_path / "Scripts" / "pip.exe"
-        else:  # Linux/macOS
+        else:
             return cls._venv_path / "bin" / "pip"
 
     @classmethod
     def _get_site_packages_path(cls) -> str:
-        """获取虚拟环境的 site-packages 路径"""
-        if os.name == "nt":  # Windows
+        if os.name == "nt":
             return str(cls._venv_path / "Lib" / "site-packages")
-        else:  # Linux/macOS
+        else:
             py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
             return str(cls._venv_path / "lib" / py_version / "site-packages")
 
     @classmethod
     def _get_package_name(cls, dependency: str) -> str | None:
-        """从依赖字符串中提取包名 (e.g., 'requests==2.28.1' -> 'requests')"""
         match = re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-_.]*", dependency)
         return match.group(0) if match else None
 
     @classmethod
     def _add_to_sys_path(cls) -> None:
-        """
-        将虚拟环境的 site-packages 路径添加到 sys.path 末尾。
-
-        设计说明:
-        这种方式将沙盒环境作为主环境的“扩展”，而不是完全“隔离”。
-        - 优点: 沙盒代码可以无缝访问主环境已安装的包，避免重复安装。
-        - 注意: 如果主环境和沙盒环境存在同名但版本不同的包，
-          会优先使用主环境的版本 (因为其路径在 sys.path 中靠前)，
-          这可能导致非预期的行为。
-        """
         if not cls._venv_path.exists():
             return
-
         site_packages_path = cls._get_site_packages_path()
         if site_packages_path not in sys.path:
             sys.path.append(site_packages_path)
@@ -81,33 +67,37 @@ class DependencyManager:
 
     @classmethod
     def ensure_dependencies(cls) -> None:
-        """
-        确保沙盒环境和依赖项已正确安装。
-
-        如果 requirements.txt 存在，则创建虚拟环境并安装所有依赖。
-        此方法是初始化和检查环境的主要入口点。
-        """
         if not cls._requirements_file.exists():
-            # 确保依赖文件至少是存在的，即使是空的
             cls._requirements_file.touch()
             logger.debug("依赖文件不存在，已创建空文件。")
 
-        # 确保虚拟环境存在
         if not cls._venv_path.exists() or not cls._get_pip_executable().exists():
-            logger.info(f"沙盒虚拟环境不存在或不完整，将重新构建。")
-            cls.rebuild_environment()
+            logger.info(f"虚拟环境不存在或不完整，正在创建: {cls._venv_path}")
+            venv.create(cls._venv_path, with_pip=True)
+
+        if cls._requirements_file.read_text(encoding="utf-8").strip():
+            try:
+                pip_executable = cls._get_pip_executable()
+                logger.info(f"正在检查并同步沙盒依赖于: {cls._requirements_file}")
+                subprocess.check_call([
+                    str(pip_executable), "install", "-r", str(cls._requirements_file)
+                ])
+                logger.debug("依赖同步完成。")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"依赖同步失败，建议尝试重建环境: {e}")
+                raise
         else:
-            # 如果环境已存在，只需确保路径已加载
-            cls._add_to_sys_path()
-            logger.debug("沙盒环境已存在，跳过安装。")
+            logger.debug("依赖文件为空，跳过同步。")
+
+        cls._add_to_sys_path()
 
     @classmethod
     def rebuild_environment(cls) -> None:
         """
-        强制重新构建沙盒环境。
+        [精简版] 强制重新构建沙盒环境。
 
-        此操作会删除现有虚拟环境（如果存在），然后根据 requirements.txt 重新创建并安装所有依赖。
-        这是确保环境纯净和一致的最可靠方法。
+        此操作通过删除现有虚拟环境，然后调用 `ensure_dependencies` 来完成
+        一个完整的、纯净的重建过程。
         """
         logger.info("开始重建沙盒环境...")
 
@@ -115,32 +105,13 @@ class DependencyManager:
             logger.debug(f"删除现有虚拟环境: {cls._venv_path}")
             shutil.rmtree(cls._venv_path)
 
-        logger.info(f"创建沙盒虚拟环境: {cls._venv_path}")
-        import venv
-        venv.create(cls._venv_path, with_pip=True)
+        # 删除后，ensure_dependencies 会自动处理创建和安装的全部流程
+        cls.ensure_dependencies()
 
-        if cls._requirements_file.exists() and cls._requirements_file.read_text().strip():
-            try:
-                pip_executable = cls._get_pip_executable()
-                logger.info(f"从 {cls._requirements_file} 安装依赖包...")
-
-                subprocess.check_call([
-                    str(pip_executable), "install", "-r", str(cls._requirements_file)
-                ])
-                logger.info("依赖包安装完成。")
-
-            except subprocess.CalledProcessError as e:
-                logger.error(f"依赖包安装失败: {e}")
-                raise
-        else:
-            logger.info("依赖文件为空，无需安装。")
-
-        cls._add_to_sys_path()
         logger.info("沙盒环境重建完成。")
 
     @classmethod
     def get_dependency_list(cls) -> list[str]:
-        """获取当前 `requirements.txt` 中的依赖列表（包含版本号）。"""
         if not cls._requirements_file.exists():
             return []
         try:
@@ -152,12 +123,10 @@ class DependencyManager:
 
     @classmethod
     def get_dependency_names(cls) -> list[str]:
-        """获取当前依赖包的名称列表（不含版本号）。"""
         return [name for dep in cls.get_dependency_list() if (name := cls._get_package_name(dep))]
 
     @classmethod
     def save_dependency_list(cls, dependencies: list[str]) -> None:
-        """将依赖列表保存回 `requirements.txt`。"""
         try:
             with cls._requirements_file.open("w", encoding="utf-8") as f:
                 if dependencies:
@@ -170,21 +139,11 @@ class DependencyManager:
 
     @classmethod
     def add_dependency(cls, dependency: str) -> None:
-        """
-        添加或更新单个依赖包，并重建环境以应用更改。
-
-        如果包已存在，此方法会更新其版本。
-
-        Args:
-            dependency: 依赖包，例如 "requests" 或 "requests==2.28.1"
-        """
         package_name = cls._get_package_name(dependency)
         if not package_name:
             logger.warning(f"无效的依赖包格式: {dependency}")
             return
-
         dependencies = cls.get_dependency_list()
-        # 查找是否已存在同名包
         updated = False
         for i, existing_dep in enumerate(dependencies):
             if cls._get_package_name(existing_dep) == package_name:
@@ -192,35 +151,24 @@ class DependencyManager:
                 dependencies[i] = dependency
                 updated = True
                 break
-
         if not updated:
             logger.info(f"添加新依赖包: {dependency}")
             dependencies.append(dependency)
-
         cls.save_dependency_list(dependencies)
         cls.rebuild_environment()
 
     @classmethod
     def remove_dependency(cls, package_name: str) -> None:
-        """
-        移除单个依赖包，并重建环境以应用更改。
-
-        Args:
-            package_name: 要移除的包名（无需版本号，例如 "requests"）
-        """
         package_name_to_remove = cls._get_package_name(package_name)
         if not package_name_to_remove:
             logger.warning(f"无效的包名格式: {package_name}")
             return
-
         dependencies = cls.get_dependency_list()
         original_count = len(dependencies)
-        
         remaining_deps = [
             dep for dep in dependencies
             if cls._get_package_name(dep) != package_name_to_remove
         ]
-
         if len(remaining_deps) < original_count:
             logger.info(f"已从依赖列表中移除包: {package_name_to_remove}")
             cls.save_dependency_list(remaining_deps)
@@ -230,9 +178,6 @@ class DependencyManager:
 
     @classmethod
     def clear_environment(cls) -> None:
-        """
-        完全清理沙盒环境，删除虚拟环境和依赖文件。
-        """
         logger.info("开始清理沙盒环境...")
         try:
             if cls._venv_path.exists():
