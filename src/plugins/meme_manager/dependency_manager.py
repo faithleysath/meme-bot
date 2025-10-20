@@ -200,7 +200,6 @@ class DependencyManager:
         await cls._run_pip_command("install", "--upgrade", dependency)
 
         dependencies = await cls.get_dependency_list()
-        # ... (后续更新列表的逻辑和之前一样)
         updated = False
         for i, existing_dep in enumerate(dependencies):
             if cls._get_package_name(existing_dep) == package_name:
