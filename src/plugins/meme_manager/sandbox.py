@@ -201,9 +201,6 @@ async def worker_with_limits(
     python_code: str,
     globals: dict,
     locals: dict,
-    # 注意：此处的 timeout 参数未生效，实际超时由 @asynchronous.process 装饰器中的 DEFAULT_TIMEOUT 控制。
-    # 这也是您原来的实现方式。
-    timeout: int = DEFAULT_TIMEOUT
 ) -> tuple:
     """带限制的异步代码执行工作器"""
     if not isinstance(python_code, str):
