@@ -9,6 +9,7 @@ from nonebot import logger
 from pebble import asynchronous
 from RestrictedPython import safe_builtins, compile_restricted
 from RestrictedPython.Eval import default_guarded_getiter, default_guarded_getitem
+from RestrictedPython.PrintCollector import PrintCollector
 from RestrictedPython.Guards import (
     full_write_guard,
     guarded_unpack_sequence,
@@ -166,7 +167,6 @@ EXTRA_SAFE_BUILTINS = {
     # === 其他工具函数 ===
     "hash": hash,        # 对不可哈希对象会抛出异常，仍是安全的
     "format": format,
-    "print": print,      # 可选：如不暴露可移除；已有 _print_ 映射到 logger.info
 }
 
 
@@ -230,7 +230,7 @@ def _build_safe_globals(global_vars: dict) -> dict:
         "_unpack_sequence_": guarded_unpack_sequence,      # 安全的序列解包
         "_iter_unpack_sequence_": guarded_iter_unpack_sequence,  # 安全的迭代解包
         "_write_": full_write_guard,                 # 写入保护
-        "_print_": logger.info,                      # 安全的打印输出
+        "_print_": PrintCollector,                   # 安全的打印输出
         **global_vars
     }
 
