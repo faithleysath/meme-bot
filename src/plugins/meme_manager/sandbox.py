@@ -2,10 +2,11 @@
 import pickle
 import re
 import importlib
+from pathlib import Path
 from concurrent.futures import TimeoutError as PebbleTimeoutError, TimeoutError
 
 # === 第三方库导入 ===
-from nonebot import logger
+from nonebot import logger, require
 from pebble import asynchronous
 from RestrictedPython import safe_builtins, compile_restricted
 from RestrictedPython.Eval import default_guarded_getiter, default_guarded_getitem
@@ -22,7 +23,7 @@ from RestrictedPython.Guards import (
 
 # === 沙盒安全配置 ===
 # 允许导入的模块前缀白名单（包括所有子模块）
-ALLOWED_PREFIXES = {
+BUILTIN_MODULE_PREFIXES = {
     "math",      # 数学函数
     "io",        # 输入输出操作
     "base64",    # Base64 编解码
@@ -169,6 +170,102 @@ EXTRA_SAFE_BUILTINS = {
     "format": format,
 }
 
+# ============================================================================
+# 依赖管理器
+# ============================================================================
+
+require("nonebot_plugin_localstore")
+
+import nonebot_plugin_localstore as store
+
+class DependencyManager:
+    """依赖管理器，用于沙盒环境的依赖包管理"""
+    def __init__(self):
+        self.requirements_txt_file: Path = store.get_plugin_data_file("sandbox_requirements.txt")
+        self.venv_path: Path = store.get_plugin_cache_dir() / "sandbox_venv"
+
+    def ensure_dependencies(self):
+        """确保沙盒环境的依赖包已安装"""
+        if not self.requirements_txt_file.exists():
+            return  # 没有依赖文件，无需安装
+
+        import subprocess
+        import venv
+
+        # 创建虚拟环境（如果不存在）
+        if not self.venv_path.exists():
+            venv.create(self.venv_path, with_pip=True)
+
+        # 安装依赖包
+        pip_executable = self.venv_path / "bin" / "pip"
+        subprocess.check_call([
+            str(pip_executable),
+            "install",
+            "-r",
+            str(self.requirements_txt_file)
+        ])
+
+    def get_dependency_list(self) -> list[str]:
+        """获取当前依赖包列表"""
+        if not self.requirements_txt_file.exists():
+            return []
+        with self.requirements_txt_file.open("r") as f:
+            return [line.strip() for line in f if line.strip()]
+        
+    def save_dependency_list(self, dependencies: list[str]):
+        """保存依赖包列表到 requirements.txt"""
+        with self.requirements_txt_file.open("w") as f:
+            for dep in dependencies:
+                f.write(f"{dep}\n")
+    
+    def add_dependency(self, dependency: str):
+        """添加单个依赖包并安装"""
+        dependencies = self.get_dependency_list()
+        if dependency not in dependencies:
+            dependencies.append(dependency)
+            self.save_dependency_list(dependencies)
+            self.ensure_dependencies()
+
+    def remove_dependency(self, dependency: str):
+        """移除单个依赖包并更新安装"""
+        dependencies = self.get_dependency_list()
+        if dependency in dependencies:
+            dependencies.remove(dependency)
+            self.save_dependency_list(dependencies)
+            self.ensure_dependencies()
+
+    def rebuild_environment(self):
+        """重新构建沙盒环境，重新安装所有依赖包"""
+        if self.venv_path.exists():
+            import shutil
+            shutil.rmtree(self.venv_path)
+        self.ensure_dependencies()
+
+    def clear_environment(self):
+        """清理沙盒环境，删除虚拟环境和依赖文件"""
+        if self.venv_path.exists():
+            import shutil
+            shutil.rmtree(self.venv_path)
+        if self.requirements_txt_file.exists():
+            self.requirements_txt_file.unlink()
+
+    def import_package(self, package_name: str):
+        """从沙盒环境中导入指定包"""
+        import os, sys
+        # 虚拟环境的 site-packages 路径（Windows 和 Linux/macOS 路径格式不同）
+        venv_site_packages = os.path.join(
+            os.path.abspath("./venv"),
+            "Lib", "site-packages" if os.name == "nt" else "lib",
+            f"python{sys.version_info.major}.{sys.version_info.minor}",
+            "site-packages"
+        )
+        sys.path.insert(0, venv_site_packages)
+        try:
+            return importlib.import_module(package_name)
+        finally:
+            sys.path.pop(0)
+
+dependencyManager = DependencyManager()
 
 
 # ============================================================================
