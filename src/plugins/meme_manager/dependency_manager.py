@@ -22,8 +22,7 @@ class DependencyManager:
     _requirements_file: Path = store.get_plugin_data_file("sandbox_requirements.txt")
     _venv_path: Path = store.get_plugin_cache_dir() / "sandbox_venv"
 
-    # --- 内部辅助方法 (同步) ---
-
+  
     @classmethod
     def _get_pip_executable(cls) -> Path:
         if os.name == "nt":
@@ -43,8 +42,7 @@ class DependencyManager:
         match = re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-_.]*", dependency)
         return match.group(0) if match else None
 
-    # --- 异步核心方法 ---
-
+    
     @classmethod
     async def _get_site_packages_path(cls) -> str:
         """异步获取 site-packages 路径，更可靠"""
@@ -118,8 +116,7 @@ class DependencyManager:
         except (FileNotFoundError, RuntimeError):
             logger.warning("无法添加沙盒环境路径到 sys.path，环境可能不完整。")
 
-    # --- 公共异步 API ---
-
+    
     @classmethod
     async def ensure_dependencies(cls) -> None:
         """确保虚拟环境和依赖存在并同步"""

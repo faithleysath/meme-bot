@@ -1,21 +1,12 @@
-# sandbox.py
-
-# ============================================================================
-# 标准库导入
-# ============================================================================
 
 import importlib
 import pickle
 import re
 from collections.abc import Callable
 
-# ============================================================================
-# 第三方库导入
-# ============================================================================
 
 from nonebot import logger, require
 from pebble import asynchronous
-# 恢复您原来的 TimeoutError 导入
 from concurrent.futures import TimeoutError as PebbleTimeoutError, TimeoutError
 from RestrictedPython import safe_builtins, compile_restricted
 from RestrictedPython.Eval import default_guarded_getiter, default_guarded_getitem
@@ -26,21 +17,12 @@ from RestrictedPython.Guards import (
 )
 from RestrictedPython.PrintCollector import PrintCollector
 
-# ============================================================================
-# 插件依赖导入
-# ============================================================================
 
 require("nonebot_plugin_localstore")
 
-# ============================================================================
-# 本地模块导入
-# ============================================================================
 
 from .dependency_manager import DependencyManager
 
-# ============================================================================
-# 配置常量
-# ============================================================================
 
 BUILTIN_MODULE_PREFIXES = {
     "math", "io", "base64", "PIL",
@@ -50,9 +32,6 @@ IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _import_cache: dict[str, object] = {}
 DEFAULT_TIMEOUT = 5
 
-# ============================================================================
-# 安全模块导入 (在子进程中运行)
-# ============================================================================
 
 def _is_module_allowed(module_name: str, allowed_prefixes: list[str]) -> bool:
     return any(
@@ -106,9 +85,6 @@ def _create_safe_import(allowed_prefixes: list[str]) -> Callable:
     
     return custom_safe_import
 
-# ============================================================================
-# 安全内置函数配置
-# ============================================================================
 
 _NUMERIC_BUILTINS = {
     "min": min, "max": max, "sum": sum, "abs": abs, "round": round, "len": len, "divmod": divmod, "pow": pow,
@@ -132,17 +108,13 @@ EXTRA_SAFE_BUILTINS = {
     **_NUMERIC_BUILTINS, **_SEQUENCE_BUILTINS, **_TYPE_BUILTINS, **_CONTAINER_BUILTINS, **_TYPE_CHECK_BUILTINS, **_UTILITY_BUILTINS,
 }
 
-# ============================================================================
-# 沙盒执行核心函数 (在子进程中运行)
-# ============================================================================
 
-# 恢复您原来的装饰器，由 pebble 控制固定的超时
 @asynchronous.process(timeout=DEFAULT_TIMEOUT)
 def _execute_in_process(
     code: str, 
     global_vars: dict, 
     local_vars: dict,
-    allowed_prefixes: list[str] # 这是唯一需要的修改，传入依赖列表
+    allowed_prefixes: list[str]
 ):
     """在独立子进程中安全执行 Python 代码的核心函数"""
     try:
@@ -193,9 +165,6 @@ def _filter_serializable_objects(safe_globals: dict, local_vars: dict) -> tuple:
     logger.debug(f"过滤后的局部变量: {len(filtered_locals)} 个")
     return filtered_globals, filtered_locals
 
-# ============================================================================
-# 主要接口函数 (在主进程中运行)
-# ============================================================================
 
 async def worker_with_limits(
     python_code: str,
@@ -210,19 +179,18 @@ async def worker_with_limits(
     if not isinstance(locals, dict):
         raise TypeError("locals 必须是字典")
     
-    # 这里我们不再检查 timeout 参数，因为它是固定的
-    
+      
     logger.info(f"开始执行沙盒代码，超时限制: {DEFAULT_TIMEOUT} 秒")
     logger.debug(f"代码长度: {len(python_code)} 字符")
 
     try:
-        # 1. (异步问题修复) 确保依赖存在并获取依赖列表
+        # 1. 确保依赖存在并获取依赖列表
         await DependencyManager.ensure_dependencies()
         allowed_deps = await DependencyManager.get_dependency_names()
         allowed_prefixes = list(BUILTIN_MODULE_PREFIXES) + allowed_deps
         logger.debug(f"沙盒允许的模块前缀: {allowed_prefixes}")
 
-        # 2. (恢复原状) 直接 await pebble 返回的 future
+        # 2. 直接 await pebble 返回的 future
         result = await _execute_in_process( # type: ignore
             code=python_code,
             global_vars=globals,
@@ -233,7 +201,7 @@ async def worker_with_limits(
         logger.info("沙盒代码执行成功")
         return result
 
-    # 3. (恢复原状) 捕获 pebble 的超时错误
+    # 3. 捕获 pebble 的超时错误
     except PebbleTimeoutError:
         error_msg = f"代码执行超时，超过 {DEFAULT_TIMEOUT} 秒限制"
         logger.error(error_msg)
@@ -244,9 +212,7 @@ async def worker_with_limits(
         logger.error(error_msg)
         raise e
 
-# ============================================================================
 # 公共 API 导出
-# =================================e===========================================
 
 __all__ = [
     "worker_with_limits",
