@@ -127,7 +127,7 @@ class DependencyManager:
         获取当前依赖包列表
 
         Returns:
-            依赖包名称列表
+            依赖包名称列表（包含版本号）
         """
         if not cls._requirements_file.exists():
             return []
@@ -138,6 +138,25 @@ class DependencyManager:
         except Exception as e:
             logger.error(f"读取依赖文件失败: {e}")
             return []
+
+    @classmethod
+    def get_dependency_names(cls) -> list[str]:
+        """
+        获取当前依赖包名称列表（不含版本号）
+
+        Returns:
+            依赖包名称列表（不包含版本号）
+        """
+        dependencies = cls.get_dependency_list()
+        names = []
+        for dep in dependencies:
+            # 提取包名（去掉版本号部分）
+            # 支持格式：package, package==1.0.0, package>=1.0.0, package~=1.0.0 等
+            import re
+            match = re.match(r'^([a-zA-Z0-9][a-zA-Z0-9\-_.]*)', dep)
+            if match:
+                names.append(match.group(1))
+        return names
 
     @classmethod
     def save_dependency_list(cls, dependencies: list[str]) -> None:
@@ -158,21 +177,50 @@ class DependencyManager:
             raise
 
     @classmethod
-    def add_dependency(cls, dependency: str) -> None:
+    def add_dependency(cls, dependency: str, version: str = None) -> None:
         """
         添加单个依赖包并安装
 
         Args:
-            dependency: 要添加的依赖包名称
+            dependency: 要添加的依赖包名称或完整依赖规范（如 "requests==2.28.1"）
+            version: 可选版本号（如果提供，会与 dependency 组合成 "package==version"）
+
+        Examples:
+            >>> DependencyManager.add_dependency("requests")
+            >>> DependencyManager.add_dependency("requests", "2.28.1")
+            >>> DependencyManager.add_dependency("requests==2.28.1")
         """
-        dependencies = cls.get_dependency_list()
-        if dependency not in dependencies:
+        # 如果提供了版本号，组合成完整依赖规范
+        if version is not None and "=" not in dependency:
+            dependency = f"{dependency}=={version}"
+
+        # 检查是否已存在相同包名（不考虑版本号）
+        existing_names = cls.get_dependency_names()
+        import re
+        match = re.match(r'^([a-zA-Z0-9][a-zA-Z0-9\-_.]*)', dependency)
+        if match:
+            package_name = match.group(1)
+
+            if package_name in existing_names:
+                # 找到现有依赖并替换版本
+                dependencies = cls.get_dependency_list()
+                for i, existing_dep in enumerate(dependencies):
+                    existing_match = re.match(r'^([a-zA-Z0-9][a-zA-Z0-9\-_.]*)', existing_dep)
+                    if existing_match and existing_match.group(1) == package_name:
+                        dependencies[i] = dependency
+                        cls.save_dependency_list(dependencies)
+                        cls.ensure_dependencies()
+                        logger.info(f"已更新依赖包: {existing_dep} -> {dependency}")
+                        return
+
+            # 新增依赖
+            dependencies = cls.get_dependency_list()
             dependencies.append(dependency)
             cls.save_dependency_list(dependencies)
             cls.ensure_dependencies()
             logger.info(f"已添加依赖包: {dependency}")
         else:
-            logger.debug(f"依赖包已存在: {dependency}")
+            logger.warning(f"无效的依赖包格式: {dependency}")
 
     @classmethod
     def remove_dependency(cls, dependency: str) -> None:
@@ -180,16 +228,45 @@ class DependencyManager:
         移除单个依赖包并更新安装
 
         Args:
-            dependency: 要移除的依赖包名称
+            dependency: 要移除的依赖包名称（支持包名或完整依赖规范）
+
+        Examples:
+            >>> DependencyManager.remove_dependency("requests")
+            >>> DependencyManager.remove_dependency("requests==2.28.1")
         """
         dependencies = cls.get_dependency_list()
+        import re
+
+        # 首先尝试精确匹配
         if dependency in dependencies:
             dependencies.remove(dependency)
             cls.save_dependency_list(dependencies)
             cls.ensure_dependencies()
             logger.info(f"已移除依赖包: {dependency}")
-        else:
-            logger.debug(f"依赖包不存在: {dependency}")
+            return
+
+        # 如果精确匹配失败，尝试按包名匹配
+        match = re.match(r'^([a-zA-Z0-9][a-zA-Z0-9\-_.]*)', dependency)
+        if match:
+            package_name = match.group(1)
+
+            # 查找并移除相同包名的依赖
+            removed = None
+            remaining_deps = []
+            for dep in dependencies:
+                dep_match = re.match(r'^([a-zA-Z0-9][a-zA-Z0-9\-_.]*)', dep)
+                if dep_match and dep_match.group(1) == package_name:
+                    removed = dep
+                else:
+                    remaining_deps.append(dep)
+
+            if removed:
+                cls.save_dependency_list(remaining_deps)
+                cls.ensure_dependencies()
+                logger.info(f"已移除依赖包: {removed}")
+                return
+
+        logger.debug(f"依赖包不存在: {dependency}")
 
     @classmethod
     def rebuild_environment(cls) -> None:
@@ -206,6 +283,55 @@ class DependencyManager:
 
         cls.ensure_dependencies()
         logger.info("沙盒环境重建完成")
+
+    @classmethod
+    def get_dependency_version(cls, package_name: str) -> str | None:
+        """
+        获取指定依赖包的版本号
+
+        Args:
+            package_name: 包名（不含版本号）
+
+        Returns:
+            版本号字符串，如果不存在则返回 None
+        """
+        dependencies = cls.get_dependency_list()
+        import re
+
+        for dep in dependencies:
+            match = re.match(r'^' + re.escape(package_name) + r'([=<>!~]+.*)', dep)
+            if match:
+                return match.group(1)
+        return None
+
+    @classmethod
+    def update_dependency_version(cls, package_name: str, version: str) -> None:
+        """
+        更新指定依赖包的版本号
+
+        Args:
+            package_name: 包名（不含版本号）
+            version: 新版本号
+        """
+        dependencies = cls.get_dependency_list()
+        import re
+
+        # 查找并更新依赖
+        updated = False
+        for i, dep in enumerate(dependencies):
+            match = re.match(r'^' + re.escape(package_name) + r'([=<>!~]+.*)', dep)
+            if match:
+                dependencies[i] = f"{package_name}=={version}"
+                updated = True
+                break
+
+        if not updated:
+            # 如果没有找到，添加新依赖
+            dependencies.append(f"{package_name}=={version}")
+
+        cls.save_dependency_list(dependencies)
+        cls.ensure_dependencies()
+        logger.info(f"已更新依赖包版本: {package_name}=={version}")
 
     @classmethod
     def clear_environment(cls) -> None:
