@@ -7,7 +7,6 @@
 import importlib
 import pickle
 import re
-import sys
 from collections.abc import Callable
 
 # ============================================================================
