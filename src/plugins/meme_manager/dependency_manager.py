@@ -1,13 +1,3 @@
-"""
-沙盒依赖管理器
-
-负责管理沙盒执行环境的 Python 依赖包，包括：
-- 虚拟环境创建和管理
-- 依赖包安装和卸载
-- 环境清理和重建
-- 自动路径管理
-"""
-
 import os
 import re
 import shutil
@@ -42,12 +32,33 @@ class DependencyManager:
             return cls._venv_path / "bin" / "pip"
 
     @classmethod
-    def _get_site_packages_path(cls) -> str:
+    def _get_python_executable(cls) -> Path:
         if os.name == "nt":
-            return str(cls._venv_path / "Lib" / "site-packages")
+            return cls._venv_path / "Scripts" / "python.exe"
         else:
-            py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-            return str(cls._venv_path / "lib" / py_version / "site-packages")
+            return cls._venv_path / "bin" / "python"
+
+    @classmethod
+    def _get_site_packages_path(cls) -> str:
+        # 使用子进程从虚拟环境中动态获取 site-packages 路径，更可靠
+        try:
+            python_executable = cls._get_python_executable()
+            command = [
+                str(python_executable),
+                "-c",
+                "import site; print(site.getsitepackages()[0])",
+            ]
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            return result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.error(f"无法获取 site-packages 路径: {e}")
+            # Fallback to the old method if the new one fails
+            if os.name == "nt":
+                return str(cls._venv_path / "Lib" / "site-packages")
+            else:
+                py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+                return str(cls._venv_path / "lib" / py_version / "site-packages")
+
 
     @classmethod
     def _get_package_name(cls, dependency: str) -> str | None:
@@ -55,11 +66,41 @@ class DependencyManager:
         return match.group(0) if match else None
 
     @classmethod
+    def _run_pip_command(cls, *args: str) -> None:
+        """通用 pip 命令执行器，增加日志和错误捕获"""
+        if not cls._venv_path.exists() or not cls._get_pip_executable().exists():
+            logger.error("虚拟环境或 pip 不存在，无法执行命令。")
+            raise FileNotFoundError("vnev or pip not found")
+        
+        command = [str(cls._get_pip_executable()), *args]
+        logger.info(f"正在执行命令: {' '.join(command)}")
+        try:
+            # 使用 subprocess.run 捕获输出，便于调试
+            result = subprocess.run(
+                command, 
+                capture_output=True, 
+                text=True, 
+                check=True,
+                encoding="utf-8"
+            )
+            if result.stdout:
+                logger.debug(f"Pip stdout:\n{result.stdout}")
+            if result.stderr:
+                logger.debug(f"Pip stderr:\n{result.stderr}")
+            logger.info(f"命令 {' '.join(args)} 执行成功。")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Pip 命令执行失败: {' '.join(command)}")
+            logger.error(f"返回码: {e.returncode}")
+            logger.error(f"Stdout: {e.stdout}")
+            logger.error(f"Stderr: {e.stderr}")
+            raise
+
+    @classmethod
     def _add_to_sys_path(cls) -> None:
         if not cls._venv_path.exists():
             return
         site_packages_path = cls._get_site_packages_path()
-        if site_packages_path not in sys.path:
+        if site_packages_path and site_packages_path not in sys.path:
             sys.path.append(site_packages_path)
             logger.info(f"已将沙盒环境路径添加到 sys.path: {site_packages_path}")
         else:
@@ -75,17 +116,10 @@ class DependencyManager:
             logger.info(f"虚拟环境不存在或不完整，正在创建: {cls._venv_path}")
             venv.create(cls._venv_path, with_pip=True)
 
+        # 这里的判断非常高效，是正确的选择
         if cls._requirements_file.read_text(encoding="utf-8").strip():
-            try:
-                pip_executable = cls._get_pip_executable()
-                logger.info(f"正在检查并同步沙盒依赖于: {cls._requirements_file}")
-                subprocess.check_call([
-                    str(pip_executable), "install", "-r", str(cls._requirements_file)
-                ])
-                logger.debug("依赖同步完成。")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"依赖同步失败，建议尝试重建环境: {e}")
-                raise
+            logger.info(f"正在检查并同步沙盒依赖于: {cls._requirements_file}")
+            cls._run_pip_command("install", "-r", str(cls._requirements_file))
         else:
             logger.debug("依赖文件为空，跳过同步。")
 
@@ -94,10 +128,10 @@ class DependencyManager:
     @classmethod
     def rebuild_environment(cls) -> None:
         """
-        [精简版] 强制重新构建沙盒环境。
+        强制彻底重新构建沙盒环境。
 
-        此操作通过删除现有虚拟环境，然后调用 `ensure_dependencies` 来完成
-        一个完整的、纯净的重建过程。
+        此操作会删除现有的虚拟环境，然后根据 requirements.txt 文件
+        重新安装所有依赖。这是一个耗时操作，用于修复环境问题。
         """
         logger.info("开始重建沙盒环境...")
 
@@ -105,7 +139,6 @@ class DependencyManager:
             logger.debug(f"删除现有虚拟环境: {cls._venv_path}")
             shutil.rmtree(cls._venv_path)
 
-        # 删除后，ensure_dependencies 会自动处理创建和安装的全部流程
         cls.ensure_dependencies()
 
         logger.info("沙盒环境重建完成。")
@@ -139,47 +172,71 @@ class DependencyManager:
 
     @classmethod
     def add_dependency(cls, dependency: str) -> None:
+        """
+        [高效版] 添加或更新一个依赖包，并只安装这一个包。
+        """
         package_name = cls._get_package_name(dependency)
         if not package_name:
             logger.warning(f"无效的依赖包格式: {dependency}")
             return
+        
+        # 确保环境存在
+        cls.ensure_dependencies()
+        
+        logger.info(f"正在安装/更新依赖包: {dependency}")
+        cls._run_pip_command("install", "--upgrade", dependency)
+
+        # 安装成功后，再更新 requirements.txt 文件
         dependencies = cls.get_dependency_list()
         updated = False
         for i, existing_dep in enumerate(dependencies):
             if cls._get_package_name(existing_dep) == package_name:
-                logger.info(f"更新依赖包: {existing_dep} -> {dependency}")
+                logger.debug(f"更新依赖文件中的包: {existing_dep} -> {dependency}")
                 dependencies[i] = dependency
                 updated = True
                 break
         if not updated:
-            logger.info(f"添加新依赖包: {dependency}")
+            logger.debug(f"向依赖文件添加新包: {dependency}")
             dependencies.append(dependency)
         cls.save_dependency_list(dependencies)
-        cls.rebuild_environment()
 
     @classmethod
     def remove_dependency(cls, package_name: str) -> None:
+        """
+        [高效版] 移除一个依赖包，并只卸载这一个包。
+        """
         package_name_to_remove = cls._get_package_name(package_name)
         if not package_name_to_remove:
             logger.warning(f"无效的包名格式: {package_name}")
             return
+
+        # 确保环境存在
+        cls.ensure_dependencies()
+
         dependencies = cls.get_dependency_list()
         original_count = len(dependencies)
         remaining_deps = [
             dep for dep in dependencies
             if cls._get_package_name(dep) != package_name_to_remove
         ]
+
         if len(remaining_deps) < original_count:
+            logger.info(f"正在卸载包: {package_name_to_remove}")
+            cls._run_pip_command("uninstall", "-y", package_name_to_remove)
+
             logger.info(f"已从依赖列表中移除包: {package_name_to_remove}")
             cls.save_dependency_list(remaining_deps)
-            cls.rebuild_environment()
         else:
-            logger.debug(f"依赖包不存在，无需移除: {package_name_to_remove}")
+            logger.warning(f"依赖包不存在，无需移除: {package_name_to_remove}")
 
     @classmethod
     def clear_environment(cls) -> None:
         logger.info("开始清理沙盒环境...")
         try:
+            site_packages_path = cls._get_site_packages_path()
+            if site_packages_path in sys.path:
+                sys.path.remove(site_packages_path)
+
             if cls._venv_path.exists():
                 shutil.rmtree(cls._venv_path)
                 logger.debug("已删除虚拟环境。")
