@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14.3"
-dependencies = []
+dependencies = [
+    "napcat-sdk>=0.5.6",
+    "tomli-w>=1.2.0",
+]
 
 [project.scripts]
 # 定义快捷命令：uv run start-bot 

@@ -1,10 +1,19 @@
-import meme_bot.config
+import asyncio
+from napcat import NapCatClient
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"), # 输出到文件
+        logging.StreamHandler()         # 输出到控制台
+    ]
+)
 
 
-def main():
-    print("Hello from meme-bot!")
-    print(f"Using config: {meme_bot.config}")
+async def main():
+    async for event in NapCatClient()
 
 
-if __name__ == "__main__":
-    main()
+asyncio.run(main())
