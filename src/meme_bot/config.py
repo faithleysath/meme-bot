@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Config:
     env: Literal["default", "prod", "dev"] = "default"
-    ws_url: str = r"ws://{host}:{port}"
+    ws_url: str = r"ws://localhost:3001/"
     token: str = "your_token"
 
     def _apply_env_vars(self, prefix: str = "") -> None:
