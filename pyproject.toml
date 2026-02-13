@@ -11,6 +11,10 @@ dependencies = []
 # 格式为 "命令名 = 模块名.文件名:入口函数名"
 start-bot = "meme_bot.main:main"
 
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
+
 [tool.ruff]
 # 排除不需要检查的目录
 exclude = [".git", ".venv", "__pycache__", "build", "dist"]
