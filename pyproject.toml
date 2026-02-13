@@ -48,7 +48,7 @@ skip-magic-trailing-comma = false
 typeCheckingMode = "standard"
 pythonVersion = "3.14"
 # 只对你的核心代码进行严格检查，提高 IDE 性能
-include = ["meme_bot"]
+include = ["src/meme_bot"]
 exclude = ["**/node_modules", "**/__pycache__", ".venv", "venv"]
 # 解决 VS Code 环境识别冲突，显式定义运行环境
 executionEnvironments = [{ root = "." }]
