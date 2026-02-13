@@ -6,15 +6,14 @@ readme = "README.md"
 requires-python = ">=3.14.3"
 dependencies = []
 
+[project.scripts]
+# 定义快捷命令：uv run start-bot 
+# 格式为 "命令名 = 模块名.文件名:入口函数名"
+start-bot = "meme_bot.main:main"
+
 [tool.ruff]
 # 排除不需要检查的目录
-exclude = [
-    ".git",
-    ".venv",
-    "__pycache__",
-    "build",
-    "dist",
-]
+exclude = [".git", ".venv", "__pycache__", "build", "dist"]
 # 每行长度限制（100 字符是标准和舒适的平衡点）
 line-length = 100
 target-version = "py314"
@@ -28,12 +27,12 @@ target-version = "py314"
 # UP: pyupgrade (自动升级新语法)
 # N: pep8-naming (变量命名规范)
 select = ["E", "F", "I", "B", "UP", "N"]
-ignore = ["E501"] # 既然有了 formatter，忽略长度报错，让它自动换行即可
+ignore = ["E501"]                        # 既然有了 formatter，忽略长度报错，让它自动换行即可
 
 [tool.ruff.lint.isort]
 # 自动合并同库导入并按标准排序
 combine-as-imports = true
-known-first-party = ["src"] # 换成你的源代码文件夹名
+known-first-party = ["meme_bot"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -44,5 +43,8 @@ skip-magic-trailing-comma = false
 # 使用你发现的 standard 模式
 typeCheckingMode = "standard"
 pythonVersion = "3.14"
-# 排除干扰
-exclude = ["**/node_modules", "**/__pycache__", ".venv"]
+# 只对你的核心代码进行严格检查，提高 IDE 性能
+include = ["meme_bot"]
+exclude = ["**/node_modules", "**/__pycache__", ".venv", "venv"]
+# 解决 VS Code 环境识别冲突，显式定义运行环境
+executionEnvironments = [{ root = "." }]
