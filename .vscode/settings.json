@@ -1,0 +1,36 @@
+{
+  // --- 核心 Python 配置 ---
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.inlayHints.functionReturnTypes": true,
+  "python.analysis.inlayHints.variableTypes": true,
+
+  // --- Ruff 自动化设置 ---
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      // 保存时自动修复能修复的错误（如未使用的变量/import）
+      "source.fixAll.ruff": "explicit",
+      // 保存时自动排序 import (isort)
+      "source.organizeImports.ruff": "explicit"
+    }
+  },
+
+  // --- TOML 文件设置 ---
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml",
+    "editor.formatOnSave": true
+  },
+
+  // --- 界面清理 ---
+  "files.exclude": {
+    "**/.git": true,
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.ruff_cache": true
+  },
+
+  // 强制 Ruff 使用项目内环境（如果有）
+  "ruff.importStrategy": "fromEnvironment",
+  "ruff.nativeServer": true
+}

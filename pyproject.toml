@@ -5,3 +5,44 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14.3"
 dependencies = []
+
+[tool.ruff]
+# 排除不需要检查的目录
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+]
+# 每行长度限制（100 字符是标准和舒适的平衡点）
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# 启用的规则集
+# E/W: pycodestyle (风格)
+# F: Pyflakes (逻辑错误)
+# I: isort (自动排序导入)
+# B: flake8-bugbear (潜在 Bug)
+# UP: pyupgrade (自动升级新语法)
+# N: pep8-naming (变量命名规范)
+select = ["E", "F", "I", "B", "UP", "N"]
+ignore = ["E501"] # 既然有了 formatter，忽略长度报错，让它自动换行即可
+
+[tool.ruff.lint.isort]
+# 自动合并同库导入并按标准排序
+combine-as-imports = true
+known-first-party = ["src"] # 换成你的源代码文件夹名
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+[tool.pyright]
+# 使用你发现的 standard 模式
+typeCheckingMode = "standard"
+pythonVersion = "3.14"
+# 排除干扰
+exclude = ["**/node_modules", "**/__pycache__", ".venv"]
