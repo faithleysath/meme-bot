@@ -82,7 +82,11 @@ class Config:
             raise ValueError(msg)
 
         if config.env == "default":
-            config._apply_env_vars(prefix="APP_")
+            config._apply_env_vars()
+            if config == default_config:
+                logger.warning(
+                    f"{default_path} has the same values as the hardcoded defaults. You might want to modify it or set environment variables."
+                )
             return config
 
         # --- 3. 处理 Extend 配置 ---
@@ -113,7 +117,7 @@ class Config:
             )
 
         # --- 5. 环境变量覆盖（优先级最高） ---
-        final_config._apply_env_vars(prefix="APP_")
+        final_config._apply_env_vars()
 
         return final_config
 
@@ -138,4 +142,11 @@ class Config:
             raise
 
 
-config = Config.load_config()
+_config_instance = None
+
+
+def get_config() -> Config:
+    global _config_instance
+    if _config_instance is None:
+        _config_instance = Config.load_config()
+    return _config_instance

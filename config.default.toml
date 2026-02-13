@@ -1,0 +1,3 @@
+env = "default"
+ws_url = "ws://{host}:{port}"
+token = "your_token"
