@@ -1,6 +1,7 @@
 import logging
+import os
 import tomllib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -14,6 +15,35 @@ class Config:
     env: Literal["default", "prod", "dev"] = "default"
     ws_url: str = r"ws://{host}:{port}"
     token: str = "your_token"
+
+    def _apply_env_vars(self, prefix: str = "") -> None:
+        """
+        用环境变量覆盖当前配置。
+        命名规则：前缀 + 字段名大写，例如 APP_TOKEN, APP_WS_URL
+        """
+        for field in fields(self):
+            env_key = f"{prefix}{field.name.upper()}"
+            if env_key not in os.environ:
+                continue
+
+            raw_val = os.environ[env_key]
+
+            try:
+                if field.type is int:
+                    parsed_val = int(raw_val)
+                elif field.type is float:
+                    parsed_val = float(raw_val)
+                elif field.type is bool:
+                    parsed_val = raw_val.strip().lower() in ("true", "1", "yes", "on")
+                else:
+                    parsed_val = raw_val
+
+                setattr(self, field.name, parsed_val)
+                logger.info(f"Field '{field.name}' overridden by environment variable '{env_key}'")
+            except ValueError:
+                logger.error(
+                    f"Failed to parse env var {env_key}='{raw_val}' to {field.type}. Keeping current value."
+                )
 
     @classmethod
     def _get_config_path(cls, env_name: str) -> Path:
@@ -52,6 +82,7 @@ class Config:
             raise ValueError(msg)
 
         if config.env == "default":
+            config._apply_env_vars(prefix="APP_")
             return config
 
         # --- 3. 处理 Extend 配置 ---
@@ -80,6 +111,9 @@ class Config:
             logger.warning(
                 f"{extend_path} has the same actual values as {default_path}. You might want to modify it."
             )
+
+        # --- 5. 环境变量覆盖（优先级最高） ---
+        final_config._apply_env_vars(prefix="APP_")
 
         return final_config
 
